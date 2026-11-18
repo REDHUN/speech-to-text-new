@@ -142,8 +142,8 @@ class LiveSpeechRecorderScreen extends StatelessWidget {
             _buildTranscriptionCard(context, vm),
             const SizedBox(height: 16),
 
-            // 6. Playback Control Panel (appears after recording)
-            if (vm.lastResult != null) ...[
+            // 6. Playback Control Panel (appears after recording is stopped)
+            if (!vm.isRecording && !vm.isPaused && vm.lastResult != null) ...[
               PlaybackControlPanel(viewModel: vm),
               const SizedBox(height: 16),
             ],

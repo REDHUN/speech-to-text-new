@@ -36,9 +36,14 @@ class AudioPlaybackManager {
      */
     fun play(filePath: String): Boolean {
         val file = File(filePath)
-        if (!file.exists() || file.length() == 0L) {
+        if (!file.exists()) {
             updateState(PlaybackState.ERROR)
-            onError?.invoke("FILE_NOT_FOUND", "Playback audio file does not exist or is empty: $filePath")
+            onError?.invoke("FILE_NOT_FOUND", "Playback audio file does not exist: $filePath")
+            return false
+        }
+        if (file.length() <= 44L) {
+            updateState(PlaybackState.ERROR)
+            onError?.invoke("AUDIO_EMPTY", "Recorded audio is empty (no sound captured): $filePath")
             return false
         }
 

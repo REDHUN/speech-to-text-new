@@ -6,6 +6,7 @@ import android.os.Looper
 import com.livespeechrecorder.live_speech_recorder.audio.AudioCaptureManager
 import com.livespeechrecorder.live_speech_recorder.audio.CaptureState
 import com.livespeechrecorder.live_speech_recorder.audio.PcmAudioDistributor
+import com.livespeechrecorder.live_speech_recorder.audio.PcmConsumer
 import com.livespeechrecorder.live_speech_recorder.audio.VoiceActivityDetector
 import com.livespeechrecorder.live_speech_recorder.audio.WavFileWriter
 import com.livespeechrecorder.live_speech_recorder.formatting.SentenceFormatter
@@ -36,6 +37,8 @@ class RecognitionSessionManager(
 
     private var audioCaptureManager: AudioCaptureManager? = null
     private var wavWriter: WavFileWriter? = null
+    private var wavConsumer: PcmConsumer? = null
+    private var recognitionConsumer: PcmConsumer? = null
     private var recognitionBackend: SpeechRecognitionBackend? = null
 
     private val isRecordingActive = AtomicBoolean(false)
@@ -105,11 +108,13 @@ class RecognitionSessionManager(
         val writer = WavFileWriter(file = outputFile, sampleRate = config.sampleRate)
         writer.open()
         wavWriter = writer
-        distributor.addDirectConsumer { buffer, readSize ->
+        val directConsumer = PcmConsumer { buffer, readSize ->
             if (!isPaused.get()) {
                 writer.write(buffer, 0, readSize)
             }
         }
+        wavConsumer = directConsumer
+        distributor.addDirectConsumer(directConsumer)
 
         // 2. Select and initialize recognition backend
         val capability = RecognitionCapabilityDetector.detect(context)
@@ -163,7 +168,7 @@ class RecognitionSessionManager(
         })
 
         // 3. Register audio pipe consumer for recognition
-        distributor.addAsyncConsumer { buffer, readSize ->
+        val asyncConsumer = PcmConsumer { buffer, readSize ->
             if (!isPaused.get()) {
                 // Buffer into pre-roll ring buffer
                 appendPreRoll(buffer, readSize)
@@ -171,6 +176,8 @@ class RecognitionSessionManager(
                 recognitionBackend?.writePcm(buffer, 0, readSize)
             }
         }
+        recognitionConsumer = asyncConsumer
+        distributor.addAsyncConsumer(asyncConsumer)
 
         // 4. Initialize single AudioRecord capture
         val captureManager = AudioCaptureManager(
@@ -276,8 +283,19 @@ class RecognitionSessionManager(
         recognitionBackend?.release()
         recognitionBackend = null
 
+        // Detach consumers from distributor
+        wavConsumer?.let {
+            distributor.removeDirectConsumer(it)
+            wavConsumer = null
+        }
+        recognitionConsumer?.let {
+            distributor.removeAsyncConsumer(it)
+            recognitionConsumer = null
+        }
+
         // Finalize WAV file
         val durationMs = wavWriter?.close() ?: 0L
+        wavWriter = null
 
         // Final transcript
         val finalTranscript = accumulator.getFormattedFullText()
@@ -297,6 +315,15 @@ class RecognitionSessionManager(
         recognitionBackend?.stopSession()
         recognitionBackend?.release()
         recognitionBackend = null
+
+        wavConsumer?.let {
+            distributor.removeDirectConsumer(it)
+            wavConsumer = null
+        }
+        recognitionConsumer?.let {
+            distributor.removeAsyncConsumer(it)
+            recognitionConsumer = null
+        }
 
         wavWriter?.cancel()
         wavWriter = null

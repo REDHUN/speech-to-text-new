@@ -98,16 +98,18 @@ class WavFileWriter(
 
     /**
      * Cancels recording and deletes the incomplete file.
+     * Only deletes the file if it was actively being written to (never deletes a finalized/closed file).
      */
     fun cancel() {
         synchronized(lock) {
+            val wasWriting = isWriting
             try {
                 randomAccessFile?.close()
             } catch (ignored: Exception) {
             } finally {
                 randomAccessFile = null
                 isWriting = false
-                if (file.exists()) {
+                if (wasWriting && file.exists()) {
                     file.delete()
                 }
             }

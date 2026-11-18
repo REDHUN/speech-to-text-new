@@ -22,7 +22,7 @@ class LiveSpeechRecorderViewModel extends ChangeNotifier {
   Duration _playbackDuration = Duration.zero;
 
   double _currentAmplitude = 0.0;
-  final List<double> _amplitudeHistory = List.filled(30, 0.05);
+  final List<double> _amplitudeHistory = List.filled(30, 0.05, growable: true);
 
   RecognitionCapability? _capability;
   RecordingResult? _lastResult;
@@ -147,11 +147,15 @@ class LiveSpeechRecorderViewModel extends ChangeNotifier {
         return;
       }
 
+      _lastResult = null;
       _fullTranscription = '';
       _partialTranscription = '';
       _confirmedTranscription = '';
       _segments = [];
       _recordingDuration = Duration.zero;
+      _playbackPosition = Duration.zero;
+      _playbackDuration = Duration.zero;
+      _amplitudeHistory.fillRange(0, _amplitudeHistory.length, 0.05);
 
       await _recorder.initialize(
         language: _selectedLanguage,
@@ -204,11 +208,15 @@ class LiveSpeechRecorderViewModel extends ChangeNotifier {
   Future<void> cancelRecording() async {
     try {
       await _recorder.cancel();
+      _lastResult = null;
       _fullTranscription = '';
       _partialTranscription = '';
       _confirmedTranscription = '';
       _segments = [];
       _recordingDuration = Duration.zero;
+      _playbackPosition = Duration.zero;
+      _playbackDuration = Duration.zero;
+      _amplitudeHistory.fillRange(0, _amplitudeHistory.length, 0.05);
       notifyListeners();
     } catch (e) {
       _errorMessage = 'Cancel error: $e';
@@ -219,9 +227,17 @@ class LiveSpeechRecorderViewModel extends ChangeNotifier {
   // Playback Operations
   Future<void> playAudio() async {
     try {
+      if (isRecording || isPaused) {
+        _errorMessage = 'Please stop recording before playing audio.';
+        notifyListeners();
+        return;
+      }
       if (_lastResult != null) {
         await _recorder.play(filePath: _lastResult!.audioPath);
         _playbackDuration = await _recorder.getPlaybackDuration();
+      } else {
+        _errorMessage = 'No recorded audio available to play.';
+        notifyListeners();
       }
     } catch (e) {
       _errorMessage = 'Play error: $e';

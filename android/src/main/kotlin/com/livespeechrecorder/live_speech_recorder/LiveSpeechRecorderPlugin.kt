@@ -247,7 +247,7 @@ class LiveSpeechRecorderPlugin : FlutterPlugin, MethodCallHandler {
                 val outputFile = if (!customPath.isNullOrBlank()) {
                     File(customPath)
                 } else {
-                    val recordingsDir = File(ctx.cacheDir, "recordings").apply { mkdirs() }
+                    val recordingsDir = File(ctx.filesDir, "recordings").apply { mkdirs() }
                     File(recordingsDir, "recording_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}.wav")
                 }
 

@@ -111,13 +111,15 @@ class PlaybackControlPanel extends StatelessWidget {
 
                 // Play / Pause Toggle Button
                 FilledButton.tonal(
-                  onPressed: () {
-                    if (viewModel.isPlaying) {
-                      viewModel.pauseAudio();
-                    } else {
-                      viewModel.playAudio();
-                    }
-                  },
+                  onPressed: (viewModel.isRecording || viewModel.isPaused)
+                      ? null
+                      : () {
+                          if (viewModel.isPlaying) {
+                            viewModel.pauseAudio();
+                          } else {
+                            viewModel.playAudio();
+                          }
+                        },
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
