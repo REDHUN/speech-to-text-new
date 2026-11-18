@@ -22,8 +22,11 @@ export 'src/models/speech_recorder_exception.dart';
 export 'src/models/transcription_result.dart';
 export 'src/models/transcription_segment.dart';
 
-/// Single-microphone audio recording with live speech transcription on
-/// Android 13 (API 33) and newer.
+/// Single-microphone audio recording for Android 6.0 (API 23) and newer, with
+/// live speech transcription on Android 13 (API 33) and newer.
+///
+/// On older versions audio is still recorded, and `TRANSCRIPTION_UNAVAILABLE`
+/// is sent through [errorStream].
 ///
 /// Methods report failures by throwing [SpeechRecorderException]. Commands sent
 /// while another is in progress run in order.

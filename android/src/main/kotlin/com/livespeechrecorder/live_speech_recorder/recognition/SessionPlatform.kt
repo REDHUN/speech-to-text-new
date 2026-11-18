@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.ActivityManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.speech.SpeechRecognizer
@@ -33,7 +34,7 @@ interface SessionPlatform {
     fun stopForegroundNotice()
     fun createCapture(sampleRate: Int, distributor: PcmAudioDistributor): PcmCaptureSource
 
-    /** @return null when the device has no speech recognition service. */
+    /** @return null when live transcription is not possible on this device. */
     fun createBackend(config: RecognitionConfig): SpeechRecognitionBackend?
 }
 
@@ -89,6 +90,9 @@ class AndroidSessionPlatform(private val context: Context) : SessionPlatform {
         AudioCaptureManager(sampleRate, distributor)
 
     override fun createBackend(config: RecognitionConfig): SpeechRecognitionBackend? {
+        // Older versions cannot share the recording's audio with the recognizer.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null
+
         val available = SpeechRecognizer.isRecognitionAvailable(context) ||
             SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
         return if (available) AndroidSpeechRecognizerBackend(context, config) else null

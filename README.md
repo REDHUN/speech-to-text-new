@@ -1,6 +1,8 @@
 # LiveSpeechRecorder (`live_speech_recorder`)
 
-A Flutter plugin for **Android 13 (API 33) and newer** that provides **simultaneous single-microphone lossless WAV audio recording** and **real-time live speech-to-text transcription**.
+A Flutter plugin for **Android 6.0 (API 23) and newer** that provides **single-microphone lossless WAV audio recording**, with **real-time live speech-to-text transcription on Android 13 (API 33) and newer**.
+
+On Android 6–12, recording and playback work, but live transcription is unavailable. `start()` still succeeds, and `TRANSCRIPTION_UNAVAILABLE` is sent through `errorStream`.
 
 Designed specifically for educational exams, oral assessments, interview platforms, voice notes, and long-form spoken answers where users speak continuously while the application captures clean audio and displays live transcription.
 
@@ -40,7 +42,7 @@ Traditional speech-to-text solutions on Android attempt to open an independent m
 ```
 
 - **Isolated Paths**: Capture, disk writes and recognition each run on their own threads, so a slow recognizer cannot delay the recording. If storage fails or cannot keep up, the recording ends with a fatal error and keeps its audio.
-- **Audio Source Injection**: PCM is piped into Android's `SpeechRecognizer` using `RecognizerIntent.EXTRA_AUDIO_SOURCE`.
+- **Audio Source Injection**: On Android 13+, PCM is piped into Android's `SpeechRecognizer` using `RecognizerIntent.EXTRA_AUDIO_SOURCE`.
 - **Injection Check**: Some recognition services may ignore injected audio. If one stops reading it, the plugin ends that recognition session and reports `AUDIO_INJECTION_UNSUPPORTED`. Audio recording continues.
 
 ---
@@ -117,10 +119,12 @@ android {
     compileSdk 36
 
     defaultConfig {
-        minSdk 33 // Android 13 or higher
+        minSdk 23 // Android 6.0 or higher. Live transcription needs Android 13.
     }
 }
 ```
+
+The plugin supports API 23, but your Flutter version sets its own minimum. Flutter 3.47, for example, is built for API 24 and rewrites `minSdk = 23` to `flutter.minSdkVersion` during builds, so its apps cannot run on Android 6.
 
 ---
 

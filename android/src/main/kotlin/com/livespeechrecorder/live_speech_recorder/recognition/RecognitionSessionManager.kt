@@ -412,7 +412,7 @@ class RecognitionSessionManager(
     private fun attachBackend() {
         val newBackend = platform.createBackend(config)
         if (newBackend == null) {
-            reportWarning("RECOGNIZER_UNAVAILABLE", "This device has no speech recognition service. Audio is still being recorded.")
+            reportWarning("TRANSCRIPTION_UNAVAILABLE", "Live transcription is not available on this device. Audio is still being recorded.")
             return
         }
         newBackend.initialize(backendListener)

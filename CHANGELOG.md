@@ -4,7 +4,7 @@
 
 ### Breaking changes
 
-- Android 13 (API 33) is now the minimum. The non-functional fallback backend is removed.
+- Live transcription now requires Android 13 (API 33). Android 6–12 (API 23–32) record audio and report `TRANSCRIPTION_UNAVAILABLE`. The non-functional fallback backend is removed.
 - Methods throw `SpeechRecorderException` instead of `PlatformException`.
 - `initialize()` throws `ALREADY_RECORDING` during a recording, and `play()` throws `RECORDING_ACTIVE`.
 - `dispose()` and engine teardown now finalize an active recording instead of deleting it.

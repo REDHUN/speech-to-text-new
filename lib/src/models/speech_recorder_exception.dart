@@ -8,7 +8,7 @@ import 'package:flutter/services.dart';
 /// - Fatal during recording: `CAPTURE_FAILED`, `DISK_WRITE_FAILED`, `DISK_TOO_SLOW`.
 /// - Recording warnings: `MIC_SILENCED`, `MIC_INPUT_LOST`, `MIC_RESTORED`,
 ///   `AUDIO_ROUTE_CHANGED`, `CAPTURE_RESTARTED`, `BACKGROUND_RECORDING_UNAVAILABLE`.
-/// - Transcription: `RECOGNIZER_UNAVAILABLE`, `OFFLINE_UNAVAILABLE`,
+/// - Transcription: `TRANSCRIPTION_UNAVAILABLE`, `OFFLINE_UNAVAILABLE`,
 ///   `AUDIO_INJECTION_UNSUPPORTED`, `NETWORK_ERROR`, `LANGUAGE_NOT_SUPPORTED`,
 ///   `LANGUAGE_UNAVAILABLE`.
 class SpeechRecorderException implements Exception {

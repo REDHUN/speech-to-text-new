@@ -6,8 +6,10 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioRecordingConfiguration
 import android.media.MediaRecorder
+import android.os.Build
 import android.os.Process
 import android.util.Log
+import androidx.annotation.RequiresApi
 import java.util.concurrent.Executor
 import kotlin.math.max
 
@@ -113,7 +115,10 @@ class AudioCaptureManager(
                 record.release()
                 return null to failure("MIC_BUSY", "The microphone is in use by another app.")
             }
-            observeRecordingConfiguration(record)
+            isSilencedByAndroid = false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                observeRecordingConfiguration(record)
+            }
             return record to CaptureStartResult(true)
         } catch (e: SecurityException) {
             record?.release()
@@ -133,9 +138,9 @@ class AudioCaptureManager(
     }
 
     /** Reports when the OS silences this client (calls, background limits) or changes the input device. */
+    @RequiresApi(Build.VERSION_CODES.Q)
     private fun observeRecordingConfiguration(record: AudioRecord) {
         val sessionId = record.audioSessionId
-        isSilencedByAndroid = false
         record.registerAudioRecordingCallback(directExecutor, object : AudioManager.AudioRecordingCallback() {
             private var silenced = false
             private var deviceId: Int? = null

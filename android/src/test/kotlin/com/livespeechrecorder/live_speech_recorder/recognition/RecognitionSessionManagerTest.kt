@@ -458,7 +458,7 @@ class RecognitionSessionManagerTest {
         capture!!.feed(3200)
         settle()
 
-        assertTrue(errors.any { it.first == "RECOGNIZER_UNAVAILABLE" && !it.third })
+        assertTrue(errors.any { it.first == "TRANSCRIPTION_UNAVAILABLE" && !it.third })
         assertEquals(100L, stopRecording()!!.durationMs)
     }
 

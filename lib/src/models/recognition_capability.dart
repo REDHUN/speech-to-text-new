@@ -5,7 +5,8 @@ class RecognitionCapability {
   /// Whether an Android speech recognition service is available.
   final bool hasSpeechRecognizer;
 
-  /// Whether the device can attempt shared-microphone audio injection.
+  /// Whether the device can attempt shared-microphone audio injection, which
+  /// live transcription requires. Always false before Android 13.
   ///
   /// Android cannot report whether a recognition service honors injected audio
   /// ahead of time. If it does not, recording continues and

@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.os.Build
 import android.os.IBinder
 
 /**
@@ -23,11 +24,12 @@ class RecordingForegroundService : Service() {
         val title = intent?.getStringExtra(EXTRA_TITLE) ?: "Recording audio"
         val text = intent?.getStringExtra(EXTRA_TEXT) ?: "Microphone is in use"
         try {
-            startForeground(
-                NOTIFICATION_ID,
-                buildNotification(title, text),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            )
+            val notification = buildNotification(title, text)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
         } catch (e: RuntimeException) {
             startPending = false
             stopRequested = false
@@ -43,15 +45,20 @@ class RecordingForegroundService : Service() {
     }
 
     private fun buildNotification(title: String, text: String): Notification {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "Audio recording", NotificationManager.IMPORTANCE_LOW)
-        )
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, "Audio recording", NotificationManager.IMPORTANCE_LOW)
+            )
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
         val contentIntent = launchIntent?.let {
             PendingIntent.getActivity(this, 0, it, PendingIntent.FLAG_IMMUTABLE)
         }
-        return Notification.Builder(this, CHANNEL_ID)
+        return builder
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentTitle(title)
             .setContentText(text)
@@ -78,7 +85,11 @@ class RecordingForegroundService : Service() {
             stopRequested = false
             startPending = true
             try {
-                context.startForegroundService(intent)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
             } catch (e: RuntimeException) {
                 startPending = false
                 throw e

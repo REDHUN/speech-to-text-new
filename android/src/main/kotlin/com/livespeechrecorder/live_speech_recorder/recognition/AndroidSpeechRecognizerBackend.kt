@@ -3,6 +3,7 @@ package com.livespeechrecorder.live_speech_recorder.recognition
 import android.content.Context
 import android.content.Intent
 import android.media.AudioFormat
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -17,6 +18,7 @@ import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
 import android.system.StructPollfd
+import androidx.annotation.RequiresApi
 import java.io.IOException
 import java.util.Locale
 import java.util.concurrent.Executor
@@ -24,8 +26,9 @@ import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Speech recognition through Android's SpeechRecognizer, fed by the shared capture session
- * through a pipe (RecognizerIntent.EXTRA_AUDIO_SOURCE).
+ * through a pipe (RecognizerIntent.EXTRA_AUDIO_SOURCE), which requires Android 13.
  */
+@RequiresApi(Build.VERSION_CODES.TIRAMISU)
 class AndroidSpeechRecognizerBackend(
     private val context: Context,
     private val config: RecognitionConfig

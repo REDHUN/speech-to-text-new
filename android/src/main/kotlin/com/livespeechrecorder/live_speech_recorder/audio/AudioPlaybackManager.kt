@@ -8,8 +8,10 @@ import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaPlayer
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import androidx.annotation.RequiresApi
 import java.io.File
 
 enum class PlaybackState {
@@ -37,7 +39,10 @@ class AudioPlaybackManager(private val context: Context) {
     private var startWhenPrepared = true
     private var resumeOnFocusGain = false
     private var playbackSpeed = 1.0f
-    private var focusRequest: AudioFocusRequest? = null
+
+    // Held as Any because AudioFocusRequest does not exist before Android 8.
+    private var focusRequest: Any? = null
+    private val focusChangeListener = AudioManager.OnAudioFocusChangeListener(::onAudioFocusChanged)
     private var noisyReceiverRegistered = false
 
     private val progressRunnable = object : Runnable {
@@ -186,7 +191,11 @@ class AudioPlaybackManager(private val context: Context) {
         if (!isPrepared) return false
         return try {
             val safePosition = positionMs.coerceIn(0L, player.duration.toLong())
-            player.seekTo(safePosition, MediaPlayer.SEEK_CLOSEST)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                player.seekTo(safePosition, MediaPlayer.SEEK_CLOSEST)
+            } else {
+                player.seekTo(safePosition.toInt())
+            }
             mainHandler.post { emitPosition() }
             true
         } catch (e: IllegalStateException) {
@@ -242,17 +251,38 @@ class AudioPlaybackManager(private val context: Context) {
     }
 
     private fun acquireAudioFocus(): Boolean {
-        val request = focusRequest ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-            .setAudioAttributes(audioAttributes)
-            .setOnAudioFocusChangeListener(::onAudioFocusChanged, mainHandler)
-            .build()
-            .also { focusRequest = it }
-        return audioManager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            requestAudioFocusWithRequest()
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.requestAudioFocus(
+                focusChangeListener,
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+            )
+        }
+        return result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun requestAudioFocusWithRequest(): Int {
+        val request = focusRequest as AudioFocusRequest?
+            ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(audioAttributes)
+                .setOnAudioFocusChangeListener(focusChangeListener, mainHandler)
+                .build()
+                .also { focusRequest = it }
+        return audioManager.requestAudioFocus(request)
     }
 
     private fun abandonAudioFocus() {
-        focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
-        focusRequest = null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            (focusRequest as AudioFocusRequest?)?.let { audioManager.abandonAudioFocusRequest(it) }
+            focusRequest = null
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.abandonAudioFocus(focusChangeListener)
+        }
     }
 
     private fun onAudioFocusChanged(change: Int) {
@@ -276,11 +306,12 @@ class AudioPlaybackManager(private val context: Context) {
 
     private fun registerNoisyReceiver() {
         if (noisyReceiverRegistered) return
-        context.registerReceiver(
-            noisyReceiver,
-            IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY),
-            Context.RECEIVER_NOT_EXPORTED
-        )
+        val filter = IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(noisyReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(noisyReceiver, filter)
+        }
         noisyReceiverRegistered = true
     }
 
