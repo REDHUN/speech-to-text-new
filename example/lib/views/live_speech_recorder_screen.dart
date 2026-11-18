@@ -307,7 +307,7 @@ class LiveSpeechRecorderScreen extends StatelessWidget {
                 padding: const EdgeInsets.symmetric(vertical: 14),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
               ),
-              onPressed: vm.startRecording,
+              onPressed: vm.isStarting ? null : vm.startRecording,
             ),
           )
         else ...[

@@ -1,391 +1,642 @@
 package com.livespeechrecorder.live_speech_recorder.recognition
 
-import android.content.Context
-import android.os.Handler
-import android.os.Looper
-import com.livespeechrecorder.live_speech_recorder.audio.AudioCaptureManager
-import com.livespeechrecorder.live_speech_recorder.audio.CaptureState
+import com.livespeechrecorder.live_speech_recorder.audio.CaptureListener
 import com.livespeechrecorder.live_speech_recorder.audio.PcmAudioDistributor
+import com.livespeechrecorder.live_speech_recorder.audio.PcmCaptureSource
 import com.livespeechrecorder.live_speech_recorder.audio.PcmConsumer
+import com.livespeechrecorder.live_speech_recorder.audio.PcmRingBuffer
 import com.livespeechrecorder.live_speech_recorder.audio.VoiceActivityDetector
 import com.livespeechrecorder.live_speech_recorder.audio.WavFileWriter
+import com.livespeechrecorder.live_speech_recorder.audio.WavRecordingSink
 import com.livespeechrecorder.live_speech_recorder.formatting.SentenceFormatter
-import com.livespeechrecorder.live_speech_recorder.formatting.TimedSegment
 import com.livespeechrecorder.live_speech_recorder.formatting.TranscriptAccumulator
 import java.io.File
-import java.util.UUID
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicLong
+
+data class RecordingSummary(
+    val audioPath: String,
+    val transcription: String,
+    val durationMs: Long,
+    val fileSizeBytes: Long,
+    val sampleRate: Int,
+    val channels: Int,
+    /** The error that ended the recording early, or null if it was stopped normally. */
+    val failureCode: String?
+)
+
+data class StartOutcome(
+    val audioPath: String? = null,
+    val errorCode: String? = null,
+    val errorMessage: String? = null
+)
+
+data class TranscriptUpdate(
+    val partialText: String,
+    val formattedPartial: String,
+    val isFinal: Boolean,
+    /** True when earlier segments no longer apply because a new recording began. */
+    val isReset: Boolean
+)
 
 /**
- * Orchestrates the unified single-microphone capture, WAV recording, speech recognition session
- * lifecycle, automatic session recovery, deduplication, and streaming transcription dispatch.
+ * The state machine for one configured recorder.
+ *
+ * All public methods and callbacks run on the main thread. Blocking work runs on the platform's
+ * background thread, during which the session is in a transitional state. Commands arriving in
+ * that window are queued and run in order, so rapid button presses cannot overlap.
  */
 class RecognitionSessionManager(
-    private val context: Context,
+    private val platform: SessionPlatform,
     private val config: RecognitionConfig = RecognitionConfig()
 ) {
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private enum class State(val wireName: String?, val isTransitional: Boolean = false) {
+        IDLE("IDLE"),
+        STARTING(null, true),
+        RECORDING("RECORDING"),
+        PAUSING(null, true),
+        PAUSED("PAUSED"),
+        RESUMING(null, true),
+        STOPPING(null, true),
+        CANCELLING(null, true),
+        STOPPED("STOPPED"),
+        FAILED("ERROR")
+    }
 
+    private val bytesPerSecond = config.sampleRate * BYTES_PER_SAMPLE
     private val distributor = PcmAudioDistributor()
     private val vad = VoiceActivityDetector(sampleRate = config.sampleRate)
-    private val sentenceFormatter = SentenceFormatter(
-        enablePunctuation = config.enablePunctuation,
-        enableCapitalization = true
+    private val accumulator = TranscriptAccumulator(
+        SentenceFormatter(
+            enablePunctuation = config.enablePunctuation,
+            enableCapitalization = true,
+            language = config.language
+        )
     )
-    val accumulator = TranscriptAccumulator(sentenceFormatter)
+    private val replayBuffer = PcmRingBuffer(bytesPerSecond)
+    private val capturedBytes = AtomicLong(0)
+    private val pendingCommands = ArrayDeque<() -> Unit>()
+    private val stopCallbacks = mutableListOf<(RecordingSummary?) -> Unit>()
 
-    private var audioCaptureManager: AudioCaptureManager? = null
-    private var wavWriter: WavFileWriter? = null
+    private val recognitionConsumer = PcmConsumer { buffer, size ->
+        replayBuffer.append(buffer, size)
+        backend?.writePcm(buffer, 0, size)
+    }
+
+    private var state = State.IDLE
+    private var capture: PcmCaptureSource? = null
+    @Volatile private var backend: SpeechRecognitionBackend? = null
+    private var sink: WavRecordingSink? = null
     private var wavConsumer: PcmConsumer? = null
-    private var recognitionConsumer: PcmConsumer? = null
-    private var recognitionBackend: SpeechRecognitionBackend? = null
+    private var outputFile: File? = null
+    private var lastSummary: RecordingSummary? = null
+    private var failureCode: String? = null
+    private var isFeedingRecognizer = false
+    private var replayHasConsumedAudio = false
+    private var recognitionGeneration = 0
+    private var restartFailures = 0
+    private var lastReportedFailureCode: String? = null
+    private var isFinalizing = false
+    private var released = false
 
-    private val isRecordingActive = AtomicBoolean(false)
-    private val isPaused = AtomicBoolean(false)
-    private val sessionCounter = AtomicInteger(0)
+    private var cancelRestart: (() -> Unit)? = null
+    private var cancelDurationTick: (() -> Unit)? = null
+    private var cancelFinalizeTimeout: (() -> Unit)? = null
 
-    private var recordingStartTimeMs: Long = 0L
-    private var pauseStartTimeMs: Long = 0L
-    private var totalPausedDurationMs: Long = 0L
-
-    // Pre-roll PCM buffer (stores last ~300ms) to prevent clipping first syllable on session restart
-    private val preRollLock = Any()
-    private val preRollBytes = (config.sampleRate * 2 * 300) / 1000 // 300ms
-    private val preRollBuffer = ByteArray(preRollBytes)
-    private var preRollHead = 0
-    private var preRollSize = 0
-
-    // Callback listeners
-    var onTranscriptionUpdate: ((fullText: String, partialText: String, confirmedText: String, isFinal: Boolean, segments: List<TimedSegment>) -> Unit)? = null
-    var onAmplitudeUpdate: ((normalized: Double, decibels: Double) -> Unit)? = null
+    var onTranscriptionUpdate: ((TranscriptUpdate) -> Unit)? = null
+    var onAmplitudeUpdate: ((normalized: Double) -> Unit)? = null
     var onDurationUpdate: ((durationMs: Long) -> Unit)? = null
     var onStateChanged: ((state: String) -> Unit)? = null
-    var onError: ((code: String, message: String) -> Unit)? = null
+    var onError: ((code: String, message: String, isFatal: Boolean) -> Unit)? = null
+
+    /** True from the start of a recording until its file has been finalized or discarded. */
+    val isActive: Boolean
+        get() = state != State.IDLE && state != State.STOPPED && state != State.FAILED
+
+    val activeAudioPath: String?
+        get() = if (isActive) outputFile?.absolutePath else null
+
+    val lastAudioPath: String?
+        get() = lastSummary?.audioPath ?: outputFile?.absolutePath
+
+    val wireState: String
+        get() = state.wireName ?: when (state) {
+            State.PAUSING, State.RESUMING -> "PAUSED"
+            State.STOPPING -> "STOPPED"
+            else -> "IDLE"
+        }
 
     init {
-        // Register VAD to analyze PCM audio
         distributor.addDirectConsumer(vad)
-
-        // Setup amplitude callback
-        distributor.onAmplitudeUpdated = { norm, db ->
-            mainHandler.post {
-                onAmplitudeUpdate?.invoke(norm, db)
-            }
+        distributor.onAmplitudeUpdated = { normalized, _ ->
+            platform.runOnMain { onAmplitudeUpdate?.invoke(normalized) }
         }
-
-        // Setup VAD listener to support pause-aware formatting
+        distributor.onConsumerError = { error ->
+            platform.runOnMain { reportWarning("AUDIO_PIPELINE_ERROR", "Audio processing error: ${error.message}") }
+        }
         vad.listener = object : VoiceActivityDetector.VadListener {
-            override fun onSpeechStart() {}
-            override fun onSpeechEnd(silenceDurationMs: Long) {
-                // If user paused speaking for > 1500ms, finalize any existing partial result
-                if (isRecordingActive.get() && silenceDurationMs >= 1500L) {
-                    val partial = accumulator.getCurrentPartial()
-                    if (partial.isNotBlank()) {
-                        val currentAudioTime = getActiveDurationMs()
-                        accumulator.confirmSegment(partial, currentAudioTime)
-                        dispatchTranscription(isFinal = false)
-                    }
-                }
-            }
-            override fun onPauseDetected(durationMs: Long) {}
+            override fun onSpeechStart(precedingSilenceMs: Long) = accumulator.notePause(precedingSilenceMs)
+            override fun onSpeechEnd() {}
         }
     }
 
-    /**
-     * Starts single-microphone recording and speech recognition session.
-     */
-    fun start(outputFile: File): Boolean {
-        if (isRecordingActive.get()) return false
+    /** Begins recording to [file]. [onResult] runs once the microphone is open or has failed. */
+    fun start(file: File, onResult: (StartOutcome) -> Unit) = whenSettled {
+        when {
+            released -> onResult(StartOutcome(errorCode = "NOT_INITIALIZED", errorMessage = "The recorder was released."))
+            isActive -> onResult(StartOutcome(errorCode = "ALREADY_RECORDING", errorMessage = "A recording is already in progress."))
+            !platform.hasRecordPermission() ->
+                onResult(StartOutcome(errorCode = "PERMISSION_DENIED", errorMessage = "RECORD_AUDIO permission has not been granted."))
+            else -> beginStart(file, onResult)
+        }
+    }
 
+    private fun beginStart(file: File, onResult: (StartOutcome) -> Unit) {
+        state = State.STARTING
+        outputFile = file
+        lastSummary = null
+        failureCode = null
+        lastReportedFailureCode = null
+        restartFailures = 0
+        isFinalizing = false
+        capturedBytes.set(0)
         accumulator.reset()
-        recordingStartTimeMs = System.currentTimeMillis()
-        totalPausedDurationMs = 0L
-        isRecordingActive.set(true)
-        isPaused.set(false)
+        clearReplayBuffer()
 
-        // 1. Prepare WAV file writer
-        val writer = WavFileWriter(file = outputFile, sampleRate = config.sampleRate)
-        writer.open()
-        wavWriter = writer
-        val directConsumer = PcmConsumer { buffer, readSize ->
-            if (!isPaused.get()) {
-                writer.write(buffer, 0, readSize)
+        if (config.enableBackgroundRecording &&
+            !platform.startForegroundNotice(config.notificationTitle, config.notificationText)
+        ) {
+            reportWarning("BACKGROUND_RECORDING_UNAVAILABLE", "Recording may be silenced if the app leaves the foreground.")
+        }
+
+        val newSink = WavRecordingSink(WavFileWriter(file, config.sampleRate)) { code, message ->
+            platform.runOnMain { failRecording(code, message) }
+        }
+        val consumer = PcmConsumer { buffer, size ->
+            newSink.onPcmAudio(buffer, size)
+            capturedBytes.addAndGet(size.toLong())
+        }
+        val newCapture = platform.createCapture(config.sampleRate, distributor)
+        newCapture.listener = object : CaptureListener {
+            override fun onCaptureFatal(code: String, message: String) {
+                platform.runOnMain { failRecording(code, message) }
+            }
+
+            override fun onCaptureWarning(code: String, message: String) {
+                platform.runOnMain { reportWarning(code, message) }
             }
         }
-        wavConsumer = directConsumer
-        distributor.addDirectConsumer(directConsumer)
 
-        // 2. Select and initialize recognition backend
-        val capability = RecognitionCapabilityDetector.detect(context)
-        val backend: SpeechRecognitionBackend = if (capability.supportsAudioSourceInjection && capability.hasSpeechRecognizer) {
-            AndroidSpeechRecognizerBackend()
+        sink = newSink
+        wavConsumer = consumer
+        capture = newCapture
+        distributor.addDirectConsumer(consumer)
+        attachBackend()
+        startFeedingRecognizer()
+
+        platform.runInBackground {
+            vad.reset()
+            // The microphone opens first, so a failed start never replaces an existing file.
+            // Audio captured meanwhile waits in the sink's queue.
+            val result = newCapture.start()
+            val outcome = if (!result.started) {
+                StartOutcome(errorCode = result.errorCode, errorMessage = result.errorMessage)
+            } else {
+                try {
+                    newSink.open()
+                    null
+                } catch (e: IOException) {
+                    newCapture.stop()
+                    StartOutcome(errorCode = "FILE_OPEN_FAILED", errorMessage = "Could not create the audio file: ${e.message}")
+                }
+            }
+            if (outcome != null) newSink.discard()
+            platform.runOnMain { completeStart(file, outcome, onResult) }
+        }
+    }
+
+    private fun completeStart(file: File, failure: StartOutcome?, onResult: (StartOutcome) -> Unit) {
+        if (failure != null) {
+            detachAudio()
+            releaseBackend()
+            platform.stopForegroundNotice()
+            capture = null
+            sink = null
+            outputFile = null
+            setState(State.IDLE)
+            onResult(failure)
         } else {
-            FallbackStreamingBackend()
+            setState(State.RECORDING)
+            dispatchTranscription(isFinal = false, isReset = true)
+            startRecognitionSession()
+            scheduleDurationTick()
+            onResult(StartOutcome(audioPath = file.absolutePath))
         }
-        recognitionBackend = backend
+        runPendingCommands()
+    }
 
-        backend.initialize(context, config, object : BackendListener {
-            override fun onPartialResult(text: String) {
-                if (!isRecordingActive.get()) return
-                accumulator.updatePartial(text)
-                dispatchTranscription(isFinal = false)
-            }
-
-            override fun onSegmentResult(text: String) {
-                if (!isRecordingActive.get()) return
-                val currentAudioTime = getActiveDurationMs()
-                accumulator.confirmSegment(text, currentAudioTime)
-                dispatchTranscription(isFinal = false)
-            }
-
-            override fun onSessionCompleted(finalText: String?) {
-                if (!isRecordingActive.get()) return
-
-                if (!finalText.isNullOrBlank()) {
-                    val currentAudioTime = getActiveDurationMs()
-                    accumulator.confirmSegment(finalText, currentAudioTime)
-                    dispatchTranscription(isFinal = false)
-                }
-
-                // If recording is still active, automatically restart recognition session for long-form speech
-                restartRecognitionSession()
-            }
-
-            override fun onError(code: String, message: String, isRecoverable: Boolean) {
-                if (!isRecordingActive.get()) return
-
-                // Non-fatal error: dispatch error notice to UI but DO NOT abort audio recording
-                mainHandler.post {
-                    onError?.invoke(code, message)
-                }
-
-                // If recoverable (e.g. SpeechRecognizer silence timeout), automatically restart session
-                if (isRecoverable) {
-                    restartRecognitionSession()
-                }
-            }
-        })
-
-        // 3. Register audio pipe consumer for recognition
-        val asyncConsumer = PcmConsumer { buffer, readSize ->
-            if (!isPaused.get()) {
-                // Buffer into pre-roll ring buffer
-                appendPreRoll(buffer, readSize)
-                // Write into active recognition backend
-                recognitionBackend?.writePcm(buffer, 0, readSize)
+    fun pause(onResult: (Boolean) -> Unit) = whenSettled {
+        if (state != State.RECORDING) {
+            onResult(false)
+            return@whenSettled
+        }
+        state = State.PAUSING
+        cancelTimers()
+        val activeCapture = capture
+        val activeSink = sink
+        platform.runInBackground {
+            activeCapture?.stop()
+            activeSink?.flushHeader()
+            platform.runOnMain {
+                setState(State.PAUSED)
+                emitDuration()
+                clearReplayBuffer()
+                finishRecognitionAfterDrain { finished -> if (!finished) promotePartial() }
+                onResult(true)
+                runPendingCommands()
             }
         }
-        recognitionConsumer = asyncConsumer
-        distributor.addAsyncConsumer(asyncConsumer)
+    }
 
-        // 4. Initialize single AudioRecord capture
-        val captureManager = AudioCaptureManager(
+    fun resume(onResult: (Boolean) -> Unit) = whenSettled {
+        if (state != State.PAUSED) {
+            onResult(false)
+            return@whenSettled
+        }
+        state = State.RESUMING
+        startFeedingRecognizer()
+        val activeCapture = capture
+        platform.runInBackground {
+            val result = activeCapture?.start()
+            platform.runOnMain {
+                if (result?.started == true) {
+                    setState(State.RECORDING)
+                    startRecognitionSession()
+                    scheduleDurationTick()
+                    onResult(true)
+                } else {
+                    state = State.PAUSED
+                    onResult(false)
+                    failRecording(
+                        result?.errorCode ?: "CAPTURE_FAILED",
+                        result?.errorMessage ?: "The microphone could not be reopened."
+                    )
+                }
+                runPendingCommands()
+            }
+        }
+    }
+
+    /**
+     * Stops recording, keeps the file, and waits briefly for final recognition results.
+     *
+     * Repeated calls return the same result. [onResult] receives null if nothing was recorded.
+     */
+    fun stop(onResult: (RecordingSummary?) -> Unit) = whenSettled {
+        when (state) {
+            State.RECORDING, State.PAUSED -> {
+                stopCallbacks.add(onResult)
+                beginStop()
+            }
+            else -> onResult(lastSummary)
+        }
+    }
+
+    private fun beginStop() {
+        state = State.STOPPING
+        cancelTimers()
+        cancelFinalizeTimeout = platform.runOnMainDelayed(FINAL_RESULT_TIMEOUT_MS) { finalizeStop() }
+        val activeCapture = capture
+        platform.runInBackground {
+            activeCapture?.stop()
+            platform.runOnMain {
+                finishRecognitionAfterDrain { expectsResult ->
+                    if (!expectsResult) finalizeStop()
+                }
+            }
+        }
+    }
+
+    private fun finalizeStop() {
+        if (state != State.STOPPING || isFinalizing) return
+        isFinalizing = true
+        cancelFinalizeTimeout?.invoke()
+        cancelFinalizeTimeout = null
+
+        promotePartial()
+        releaseBackend()
+        detachAudio()
+
+        val file = outputFile
+        val activeSink = sink
+        capture = null
+        sink = null
+        platform.runInBackground {
+            val durationMs = activeSink?.finish() ?: 0L
+            val sizeBytes = file?.length() ?: 0L
+            platform.runOnMain { completeStop(file, durationMs, sizeBytes) }
+        }
+    }
+
+    private fun completeStop(file: File?, durationMs: Long, sizeBytes: Long) {
+        val summary = RecordingSummary(
+            audioPath = file?.absolutePath.orEmpty(),
+            transcription = accumulator.getConfirmedText(),
+            durationMs = durationMs,
+            fileSizeBytes = sizeBytes,
             sampleRate = config.sampleRate,
-            distributor = distributor
+            channels = 1,
+            failureCode = failureCode
         )
-        audioCaptureManager = captureManager
-
-        captureManager.onError = { code, msg ->
-            mainHandler.post { onError?.invoke(code, msg) }
-        }
-
-        captureManager.startCapture()
-
-        // 5. Start initial recognition session
-        startBackendSession()
-
-        // 6. Start duration tracking loop
-        startDurationTracker()
-
-        mainHandler.post { onStateChanged?.invoke("RECORDING") }
-        return true
-    }
-
-    private fun startBackendSession() {
-        val currentSessionId = UUID.randomUUID().toString()
-        sessionCounter.incrementAndGet()
-        accumulator.setSessionStartTime(getActiveDurationMs())
-
-        recognitionBackend?.startSession(currentSessionId)
-
-        // Inject pre-roll audio into new session so initial sounds aren't truncated
-        injectPreRollAudio()
-    }
-
-    /**
-     * Seamlessly restarts speech recognition session when Android SpeechRecognizer terminates
-     * without interrupting audio recording in WavFileWriter.
-     */
-    private fun restartRecognitionSession() {
-        if (!isRecordingActive.get() || isPaused.get()) return
-
-        mainHandler.postDelayed({
-            if (isRecordingActive.get() && !isPaused.get()) {
-                startBackendSession()
-            }
-        }, 150)
-    }
-
-    fun pause() {
-        if (!isRecordingActive.get() || isPaused.get()) return
-
-        isPaused.set(true)
-        pauseStartTimeMs = System.currentTimeMillis()
-
-        audioCaptureManager?.pause()
-        wavWriter?.updateHeader()
-        recognitionBackend?.stopSession()
-
-        mainHandler.post { onStateChanged?.invoke("PAUSED") }
-    }
-
-    fun resume() {
-        if (!isRecordingActive.get() || !isPaused.get()) return
-
-        val pauseDuration = System.currentTimeMillis() - pauseStartTimeMs
-        if (pauseDuration > 0) {
-            totalPausedDurationMs += pauseDuration
-        }
-
-        isPaused.set(false)
-        audioCaptureManager?.resume()
-        startBackendSession()
-
-        mainHandler.post { onStateChanged?.invoke("RECORDING") }
-    }
-
-    /**
-     * Stops recording, finalizes WAV header, and flushes pending recognition text.
-     */
-    fun stop(): Pair<Long, String> {
-        if (!isRecordingActive.get()) {
-            val dur = wavWriter?.getDurationMs() ?: 0L
-            val txt = accumulator.getFormattedFullText()
-            return Pair(dur, txt)
-        }
-
-        isRecordingActive.set(false)
-        isPaused.set(false)
-
-        // Finalize remaining partial text into confirmed
-        val remainingPartial = accumulator.getCurrentPartial()
-        if (remainingPartial.isNotBlank()) {
-            accumulator.confirmSegment(remainingPartial, getActiveDurationMs())
-        }
-
-        // Stop audio capture first
-        audioCaptureManager?.stop()
-        audioCaptureManager = null
-
-        // Stop recognition backend
-        recognitionBackend?.stopSession()
-        recognitionBackend?.release()
-        recognitionBackend = null
-
-        // Detach consumers from distributor
-        wavConsumer?.let {
-            distributor.removeDirectConsumer(it)
-            wavConsumer = null
-        }
-        recognitionConsumer?.let {
-            distributor.removeAsyncConsumer(it)
-            recognitionConsumer = null
-        }
-
-        // Finalize WAV file
-        val durationMs = wavWriter?.close() ?: 0L
-        wavWriter = null
-
-        // Final transcript
-        val finalTranscript = accumulator.getFormattedFullText()
+        lastSummary = summary
+        platform.stopForegroundNotice()
         dispatchTranscription(isFinal = true)
+        onDurationUpdate?.invoke(durationMs)
+        setState(if (failureCode == null) State.STOPPED else State.FAILED)
 
-        mainHandler.post { onStateChanged?.invoke("STOPPED") }
-        return Pair(durationMs, finalTranscript)
+        val callbacks = stopCallbacks.toList()
+        stopCallbacks.clear()
+        callbacks.forEach { it(summary) }
+        runPendingCommands()
     }
 
-    fun cancel() {
-        isRecordingActive.set(false)
-        isPaused.set(false)
-
-        audioCaptureManager?.stop()
-        audioCaptureManager = null
-
-        recognitionBackend?.stopSession()
-        recognitionBackend?.release()
-        recognitionBackend = null
-
-        wavConsumer?.let {
-            distributor.removeDirectConsumer(it)
-            wavConsumer = null
-        }
-        recognitionConsumer?.let {
-            distributor.removeAsyncConsumer(it)
-            recognitionConsumer = null
+    /** Discards an in-progress recording and its file. Finished recordings are left untouched. */
+    fun cancel(onResult: (Boolean) -> Unit) = whenSettled {
+        if (state != State.RECORDING && state != State.PAUSED) {
+            lastSummary = null
+            outputFile = null
+            accumulator.reset()
+            setState(State.IDLE)
+            onResult(false)
+            return@whenSettled
         }
 
-        wavWriter?.cancel()
-        wavWriter = null
-
-        distributor.release()
-        accumulator.reset()
-
-        mainHandler.post { onStateChanged?.invoke("IDLE") }
-    }
-
-    private fun getActiveDurationMs(): Long {
-        if (recordingStartTimeMs == 0L) return 0L
-        val now = if (isPaused.get()) pauseStartTimeMs else System.currentTimeMillis()
-        val raw = now - recordingStartTimeMs - totalPausedDurationMs
-        return if (raw > 0L) raw else 0L
-    }
-
-    private fun dispatchTranscription(isFinal: Boolean) {
-        val silenceMs = vad.getCurrentSilenceDurationMs()
-        val fullText = accumulator.getFormattedFullText(silenceMs)
-        val partialText = accumulator.getCurrentPartial()
-        val confirmedText = accumulator.getConfirmedText()
-        val segments = accumulator.getSegments()
-
-        mainHandler.post {
-            onTranscriptionUpdate?.invoke(fullText, partialText, confirmedText, isFinal, segments)
+        state = State.CANCELLING
+        cancelTimers()
+        val activeCapture = capture
+        val activeSink = sink
+        releaseBackend()
+        platform.runInBackground {
+            activeCapture?.stop()
+            activeSink?.discard()
+            platform.runOnMain {
+                detachAudio()
+                capture = null
+                sink = null
+                outputFile = null
+                lastSummary = null
+                accumulator.reset()
+                platform.stopForegroundNotice()
+                dispatchTranscription(isFinal = false, isReset = true)
+                setState(State.IDLE)
+                onResult(true)
+                runPendingCommands()
+            }
         }
     }
 
-    private fun startDurationTracker() {
-        mainHandler.post(object : Runnable {
-            override fun run() {
-                if (isRecordingActive.get()) {
-                    val duration = getActiveDurationMs()
-                    onDurationUpdate?.invoke(duration)
-                    mainHandler.postDelayed(this, 250)
+    /** Finalizes any active recording, keeping its file, then frees all resources. */
+    fun release(onComplete: () -> Unit) {
+        stop {
+            whenSettled {
+                if (!released) {
+                    released = true
+                    releaseBackend()
+                    distributor.release()
                 }
+                onComplete()
             }
-        })
-    }
-
-    private fun appendPreRoll(buffer: ByteArray, length: Int) {
-        synchronized(preRollLock) {
-            val toCopy = minOf(length, preRollBytes)
-            val srcOffset = length - toCopy
-            for (i in 0 until toCopy) {
-                preRollBuffer[(preRollHead + i) % preRollBytes] = buffer[srcOffset + i]
-            }
-            preRollHead = (preRollHead + toCopy) % preRollBytes
-            preRollSize = minOf(preRollBytes, preRollSize + toCopy)
         }
     }
 
-    private fun injectPreRollAudio() {
-        synchronized(preRollLock) {
-            if (preRollSize <= 0) return
-            val linear = ByteArray(preRollSize)
-            val startIdx = (preRollHead - preRollSize + preRollBytes) % preRollBytes
-            for (i in 0 until preRollSize) {
-                linear[i] = preRollBuffer[(startIdx + i) % preRollBytes]
-            }
-            recognitionBackend?.writePcm(linear, 0, preRollSize)
+    private fun attachBackend() {
+        val newBackend = platform.createBackend(config)
+        if (newBackend == null) {
+            reportWarning("RECOGNIZER_UNAVAILABLE", "This device has no speech recognition service. Audio is still being recorded.")
+            return
         }
+        newBackend.initialize(backendListener)
+        backend = newBackend
+    }
+
+    private fun releaseBackend() {
+        recognitionGeneration++
+        backend?.release()
+        backend = null
+    }
+
+    private fun startFeedingRecognizer() {
+        if (backend != null && !isFeedingRecognizer) {
+            isFeedingRecognizer = true
+            distributor.addAsyncConsumer(recognitionConsumer)
+        }
+    }
+
+    private fun startRecognitionSession() {
+        val activeBackend = backend ?: return
+        recognitionGeneration++
+        promotePartial()
+        accumulator.setSessionStartTime(positionMs())
+
+        val replaysConsumedAudio = replayHasConsumedAudio
+        replayHasConsumedAudio = true
+        activeBackend.startSession {
+            val replay = replayBuffer.snapshot()
+            if (replay != null && replaysConsumedAudio) accumulator.beginOverlapWindow()
+            replay
+        }
+    }
+
+    /** Lets queued audio reach the recognizer, then ends its session. */
+    private fun finishRecognitionAfterDrain(onFinished: (expectsResult: Boolean) -> Unit) {
+        val generation = ++recognitionGeneration
+        val finish: () -> Unit = {
+            if (generation == recognitionGeneration) {
+                onFinished(backend?.finishSession() == true)
+            }
+        }
+        if (isFeedingRecognizer) {
+            isFeedingRecognizer = false
+            distributor.removeAsyncConsumer(recognitionConsumer) { platform.runOnMain(finish) }
+        } else {
+            finish()
+        }
+    }
+
+    private fun detachAudio() {
+        wavConsumer?.let { distributor.removeDirectConsumer(it) }
+        wavConsumer = null
+        if (isFeedingRecognizer) {
+            isFeedingRecognizer = false
+            distributor.removeAsyncConsumer(recognitionConsumer)
+        }
+    }
+
+    private val backendListener = object : BackendListener {
+        override fun onPartialResult(text: String) {
+            if (state != State.RECORDING) return
+            markRecognitionHealthy()
+            accumulator.updatePartial(text)
+            dispatchTranscription(isFinal = false)
+        }
+
+        override fun onSegmentResult(text: String, confidence: Double?) {
+            if (!acceptsResults()) return
+            markRecognitionHealthy()
+            accumulator.confirmSegment(text, positionMs(), confidence)
+            dispatchTranscription(isFinal = false)
+        }
+
+        override fun onSessionCompleted(finalText: String?, confidence: Double?) {
+            if (!acceptsResults()) return
+            if (!finalText.isNullOrBlank()) {
+                markRecognitionHealthy()
+                accumulator.confirmSegment(finalText, positionMs(), confidence)
+            } else {
+                promotePartial()
+            }
+            dispatchTranscription(isFinal = false)
+
+            when (state) {
+                State.STOPPING -> finalizeStop()
+                State.RECORDING -> scheduleRestart(afterFailure = false)
+                else -> Unit
+            }
+        }
+
+        override fun onError(failure: BackendFailure) {
+            if (!acceptsResults()) return
+            promotePartial()
+            dispatchTranscription(isFinal = false)
+
+            if (state == State.STOPPING) {
+                finalizeStop()
+                return
+            }
+            if (!failure.isRoutine && failure.code != lastReportedFailureCode) {
+                lastReportedFailureCode = failure.code
+                onError?.invoke(failure.code, failure.message, false)
+            }
+            if (failure.isRecoverable && state == State.RECORDING) {
+                scheduleRestart(afterFailure = !failure.isRoutine)
+            }
+        }
+    }
+
+    private fun acceptsResults() =
+        state == State.RECORDING || state == State.PAUSING || state == State.PAUSED ||
+            state == State.RESUMING || state == State.STOPPING
+
+    private fun markRecognitionHealthy() {
+        restartFailures = 0
+        lastReportedFailureCode = null
+    }
+
+    private fun scheduleRestart(afterFailure: Boolean) {
+        if (afterFailure) restartFailures++
+        val delayMs = if (afterFailure) {
+            minOf(RESTART_DELAY_MS shl minOf(restartFailures, MAX_BACKOFF_SHIFT), MAX_RESTART_DELAY_MS)
+        } else {
+            RESTART_DELAY_MS
+        }
+        cancelRestart?.invoke()
+        cancelRestart = platform.runOnMainDelayed(delayMs) {
+            cancelRestart = null
+            if (state == State.RECORDING) startRecognitionSession()
+        }
+    }
+
+    private fun promotePartial() {
+        val partial = accumulator.getCurrentPartial()
+        if (partial.isNotBlank()) accumulator.confirmSegment(partial, positionMs())
+    }
+
+    private fun clearReplayBuffer() {
+        replayBuffer.clear()
+        replayHasConsumedAudio = false
+    }
+
+    /** Ends the recording because audio can no longer be captured or stored. The file is kept. */
+    private fun failRecording(code: String, message: String) {
+        if (failureCode != null || state == State.IDLE || state == State.STOPPED || state == State.FAILED) return
+        failureCode = code
+        onError?.invoke(code, message, true)
+        whenSettled {
+            if (state == State.RECORDING || state == State.PAUSED) beginStop()
+        }
+    }
+
+    private fun reportWarning(code: String, message: String) {
+        onError?.invoke(code, message, false)
+    }
+
+    private fun whenSettled(command: () -> Unit) {
+        if (state.isTransitional) pendingCommands.addLast(command) else command()
+    }
+
+    private fun runPendingCommands() {
+        while (!state.isTransitional) {
+            val command = pendingCommands.removeFirstOrNull() ?: return
+            command()
+        }
+    }
+
+    private fun setState(newState: State) {
+        state = newState
+        onStateChanged?.invoke(wireState)
+    }
+
+    private fun cancelTimers() {
+        cancelRestart?.invoke()
+        cancelRestart = null
+        cancelDurationTick?.invoke()
+        cancelDurationTick = null
+    }
+
+    private fun scheduleDurationTick() {
+        cancelDurationTick?.invoke()
+        emitDuration()
+        cancelDurationTick = platform.runOnMainDelayed(DURATION_INTERVAL_MS) {
+            cancelDurationTick = null
+            if (state == State.RECORDING) scheduleDurationTick()
+        }
+    }
+
+    private fun emitDuration() {
+        onDurationUpdate?.invoke(positionMs())
+    }
+
+    /** The position in the recorded audio, which matches the WAV and excludes pauses. */
+    private fun positionMs(): Long = capturedBytes.get() * 1000L / bytesPerSecond
+
+    /** Returns confirmed segments from [index], for incremental delivery. */
+    fun segmentsFrom(index: Int) = accumulator.getSegmentsFrom(index)
+
+    /** Returns the current live transcript state, for a listener that has just attached. */
+    fun currentTranscriptUpdate() = TranscriptUpdate(
+        partialText = accumulator.getCurrentPartial(),
+        formattedPartial = accumulator.getFormattedPartial(vad.getCurrentSilenceDurationMs()),
+        isFinal = lastSummary != null,
+        isReset = true
+    )
+
+    private fun dispatchTranscription(isFinal: Boolean, isReset: Boolean = false) {
+        onTranscriptionUpdate?.invoke(
+            TranscriptUpdate(
+                partialText = accumulator.getCurrentPartial(),
+                formattedPartial = accumulator.getFormattedPartial(vad.getCurrentSilenceDurationMs()),
+                isFinal = isFinal,
+                isReset = isReset
+            )
+        )
+    }
+
+    private companion object {
+        const val BYTES_PER_SAMPLE = 2
+        const val DURATION_INTERVAL_MS = 250L
+        const val RESTART_DELAY_MS = 150L
+        const val MAX_RESTART_DELAY_MS = 10_000L
+        const val MAX_BACKOFF_SHIFT = 6
+        const val FINAL_RESULT_TIMEOUT_MS = 2_000L
     }
 }

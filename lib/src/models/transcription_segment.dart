@@ -3,24 +3,28 @@ class TranscriptionSegment {
   /// Confirmed text content of this segment.
   final String text;
 
-  /// Start timestamp in milliseconds relative to the start of recording.
+  /// Start position in the recorded audio, in milliseconds.
   final int startTimeMs;
 
-  /// End timestamp in milliseconds relative to the start of recording.
+  /// Position in the recorded audio when this segment was confirmed, in milliseconds.
   final int endTimeMs;
 
-  /// Confidence score between 0.0 and 1.0.
-  final double confidence;
+  /// Recognizer confidence from 0.0 to 1.0, or null if none was provided.
+  final double? confidence;
 
   /// Whether this segment is confirmed/finalized.
   final bool isFinal;
+
+  /// Whether a long pause came before this segment.
+  final bool startsParagraph;
 
   const TranscriptionSegment({
     required this.text,
     required this.startTimeMs,
     required this.endTimeMs,
-    this.confidence = 1.0,
+    this.confidence,
     this.isFinal = true,
+    this.startsParagraph = false,
   });
 
   Duration get startDuration => Duration(milliseconds: startTimeMs);
@@ -31,8 +35,9 @@ class TranscriptionSegment {
       text: map['text'] as String? ?? '',
       startTimeMs: (map['startTimeMs'] as num?)?.toInt() ?? 0,
       endTimeMs: (map['endTimeMs'] as num?)?.toInt() ?? 0,
-      confidence: (map['confidence'] as num?)?.toDouble() ?? 1.0,
+      confidence: (map['confidence'] as num?)?.toDouble(),
       isFinal: map['isFinal'] as bool? ?? true,
+      startsParagraph: map['startsParagraph'] as bool? ?? false,
     );
   }
 
@@ -43,6 +48,7 @@ class TranscriptionSegment {
       'endTimeMs': endTimeMs,
       'confidence': confidence,
       'isFinal': isFinal,
+      'startsParagraph': startsParagraph,
     };
   }
 

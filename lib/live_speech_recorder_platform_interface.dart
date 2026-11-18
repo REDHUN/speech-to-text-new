@@ -1,11 +1,13 @@
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'live_speech_recorder_method_channel.dart';
+import 'src/models/playback_progress.dart';
 import 'src/models/playback_state.dart';
 import 'src/models/recognition_capability.dart';
 import 'src/models/recognition_mode.dart';
 import 'src/models/recording_result.dart';
 import 'src/models/recording_state.dart';
+import 'src/models/saved_recording.dart';
 import 'src/models/speech_recorder_exception.dart';
 import 'src/models/transcription_result.dart';
 
@@ -37,6 +39,9 @@ abstract class LiveSpeechRecorderPlatform extends PlatformInterface {
     RecognitionMode recognitionMode = RecognitionMode.automatic,
     bool enablePunctuation = true,
     bool enableSegmented = true,
+    bool enableBackgroundRecording = true,
+    String notificationTitle = 'Recording audio',
+    String notificationText = 'Microphone is in use',
   }) {
     throw UnimplementedError('initialize() has not been implemented.');
   }
@@ -59,6 +64,22 @@ abstract class LiveSpeechRecorderPlatform extends PlatformInterface {
 
   Future<bool> cancel() {
     throw UnimplementedError('cancel() has not been implemented.');
+  }
+
+  Future<RecordingState> getRecordingState() {
+    throw UnimplementedError('getRecordingState() has not been implemented.');
+  }
+
+  Future<PlaybackState> getPlaybackState() {
+    throw UnimplementedError('getPlaybackState() has not been implemented.');
+  }
+
+  Future<List<SavedRecording>> listRecordings() {
+    throw UnimplementedError('listRecordings() has not been implemented.');
+  }
+
+  Future<bool> deleteRecording(String path) {
+    throw UnimplementedError('deleteRecording() has not been implemented.');
   }
 
   Future<bool> play({String? filePath}) {
@@ -107,6 +128,10 @@ abstract class LiveSpeechRecorderPlatform extends PlatformInterface {
 
   Stream<PlaybackState> get playbackStateStream {
     throw UnimplementedError('playbackStateStream has not been implemented.');
+  }
+
+  Stream<PlaybackProgress> get playbackProgressStream {
+    throw UnimplementedError('playbackProgressStream has not been implemented.');
   }
 
   Stream<double> get amplitudeStream {

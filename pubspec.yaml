@@ -1,6 +1,6 @@
 name: live_speech_recorder
 description: "Production-ready Android speech-to-text and simultaneous single-microphone audio recording Flutter plugin with intelligent formatting, offline ASR, and playback."
-version: 1.0.0
+version: 2.0.0
 homepage: https://github.com/livespeechrecorder/live_speech_recorder
 repository: https://github.com/livespeechrecorder/live_speech_recorder
 issue_tracker: https://github.com/livespeechrecorder/live_speech_recorder/issues
@@ -13,8 +13,8 @@ topics:
   - android
 
 environment:
-  sdk: ^3.12.2
-  flutter: '>=3.3.0'
+  sdk: '>=3.8.0 <4.0.0'
+  flutter: '>=3.32.0'
 
 dependencies:
   flutter:

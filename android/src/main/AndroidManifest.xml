@@ -1,16 +1,23 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.livespeechrecorder.live_speech_recorder">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Microphone permission for single AudioRecord capture session -->
+    <!-- Microphone permission for the single AudioRecord capture session -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    
-    <!-- Internet permission for online recognition backend if requested -->
-    <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- Queries to bind and query Android Speech Recognition Services on Android 11+ (API 30+) -->
+    <!-- Keeps microphone capture alive while the app is in the background -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <!-- Lets the plugin find and bind Android speech recognition services -->
     <queries>
         <intent>
             <action android:name="android.speech.RecognitionService" />
         </intent>
     </queries>
+
+    <application>
+        <service
+            android:name="com.livespeechrecorder.live_speech_recorder.RecordingForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+    </application>
 </manifest>

@@ -6,175 +6,181 @@ data class TimedSegment(
     val text: String,
     val startTimeMs: Long,
     val endTimeMs: Long,
-    val confidence: Double = 1.0,
-    val isFinal: Boolean = true
+    /** Recognizer confidence from 0.0 to 1.0, or null when the recognizer gave none. */
+    val confidence: Double? = null,
+    val isFinal: Boolean = true,
+    val startsParagraph: Boolean = false
 )
 
 /**
- * Manages the three representations of transcription:
- * 1. Confirmed text (historical finalized sentences).
- * 2. Current partial text (real-time hypothesis of current speech segment).
- * 3. Formatted full text (intelligently formatted coherent transcript).
+ * Holds confirmed segments and the live partial hypothesis. Thread-safe.
  *
- * Implements segment reconciliation and suffix-prefix deduplication across recognition session restarts.
+ * Words are only deduplicated in the window after audio has been replayed into a new recognition
+ * session, the one place recognizer output can legitimately overlap.
  */
 class TranscriptAccumulator(
     private val formatter: SentenceFormatter
 ) {
+    private val lock = Any()
     private val confirmedSegments = mutableListOf<TimedSegment>()
-    private var currentPartial: String = ""
-    private var sessionStartTimeMs: Long = 0L
+    private var currentPartial = ""
+    private var sessionStartTimeMs = 0L
+    private var overlapWindowOpen = false
+    private var paragraphBeforeNext = false
+    private var paragraphAfterNext = false
 
-    val lock = Any()
-
-    /**
-     * Resets all accumulator state.
-     */
     fun reset() {
         synchronized(lock) {
             confirmedSegments.clear()
             currentPartial = ""
             sessionStartTimeMs = 0L
+            overlapWindowOpen = false
+            paragraphBeforeNext = false
+            paragraphAfterNext = false
         }
     }
 
     fun setSessionStartTime(timestampMs: Long) {
+        synchronized(lock) { sessionStartTimeMs = timestampMs }
+    }
+
+    /** Marks that the next recognizer output may repeat words already confirmed. */
+    fun beginOverlapWindow() {
+        synchronized(lock) { overlapWindowOpen = true }
+    }
+
+    /** Records a silence that ended, so a long one can begin a new paragraph. */
+    fun notePause(silenceMs: Long) {
+        if (silenceMs < PARAGRAPH_SILENCE_MS) return
         synchronized(lock) {
-            sessionStartTimeMs = timestampMs
+            // If speech before the pause is still unconfirmed, the break belongs after it.
+            if (currentPartial.isEmpty()) paragraphBeforeNext = true else paragraphAfterNext = true
         }
     }
 
-    /**
-     * Updates the active live partial hypothesis.
-     */
     fun updatePartial(partialText: String) {
-        synchronized(lock) {
-            currentPartial = partialText.trim()
-        }
+        synchronized(lock) { currentPartial = partialText.trim() }
     }
 
     /**
-     * Confirms and appends a segment, performing n-gram deduplication against the trailing words
-     * of previous segments.
+     * Confirms a segment. Returns null when nothing new remained after deduplication.
      */
-    fun confirmSegment(rawText: String, endTimeMs: Long): TimedSegment? {
+    fun confirmSegment(rawText: String, endTimeMs: Long, confidence: Double? = null): TimedSegment? {
         synchronized(lock) {
             val trimmed = rawText.trim()
             if (trimmed.isEmpty()) return null
 
-            // Deduplicate against tail of confirmed segments
-            val deduplicated = deduplicateOverlap(trimmed)
+            val deduplicated = deduplicateLocked(trimmed)
+            overlapWindowOpen = false
+            currentPartial = ""
             if (deduplicated.isEmpty()) return null
 
             val formatted = formatter.formatText(deduplicated, isFinal = true)
             if (formatted.isEmpty()) return null
 
             val start = sessionStartTimeMs
-            val end = if (endTimeMs >= start) endTimeMs else start + 1000L
-
+            val end = maxOf(start, endTimeMs)
             val segment = TimedSegment(
                 text = formatted,
                 startTimeMs = start,
                 endTimeMs = end,
-                confidence = 1.0,
-                isFinal = true
+                confidence = confidence,
+                isFinal = true,
+                startsParagraph = paragraphBeforeNext && confirmedSegments.isNotEmpty()
             )
 
             confirmedSegments.add(segment)
-            currentPartial = ""
-            // Advance session start time for next segment
             sessionStartTimeMs = end
-
+            paragraphBeforeNext = paragraphAfterNext
+            paragraphAfterNext = false
             return segment
         }
     }
 
-    /**
-     * Suffix-prefix word reconciliation algorithm.
-     * Detects if the incoming segment begins with words that already ended the previous confirmed segment.
-     */
+    /** Removes leading words of [incoming] that repeat the end of the last segment. */
     fun deduplicateOverlap(incoming: String): String {
-        if (confirmedSegments.isEmpty()) return incoming
+        synchronized(lock) { return deduplicateLocked(incoming) }
+    }
 
+    private fun deduplicateLocked(incoming: String): String {
+        if (!overlapWindowOpen) return incoming
         val lastSegment = confirmedSegments.lastOrNull()?.text ?: return incoming
-        val lastWords = cleanWords(lastSegment)
-        val incomingWords = cleanWords(incoming)
-        val rawIncomingWords = incoming.split(Regex("\\s+")).filter { it.isNotEmpty() }
 
-        if (lastWords.isEmpty() || incomingWords.isEmpty()) return incoming
+        val lastWords = comparableWords(lastSegment)
+        val rawWords = incoming.split(WHITESPACE).filter { it.isNotEmpty() }
+        val comparable = rawWords.map(::comparableForm)
+        val comparableIndexes = comparable.indices.filter { comparable[it].isNotEmpty() }
+        val incomingWords = comparableIndexes.map { comparable[it] }
 
-        val maxOverlap = minOf(6, lastWords.size, incomingWords.size)
-
-        for (k in maxOverlap downTo 1) {
-            val tail = lastWords.takeLast(k)
-            val head = incomingWords.take(k)
-
-            if (tail == head) {
-                // Found overlap of length k words! Strip the first k words from incoming
-                val remainingWords = rawIncomingWords.drop(k)
-                return remainingWords.joinToString(" ")
+        val maxOverlap = minOf(MAX_OVERLAP_WORDS, lastWords.size, incomingWords.size)
+        for (overlap in maxOverlap downTo 1) {
+            if (lastWords.takeLast(overlap) == incomingWords.take(overlap)) {
+                return rawWords.drop(comparableIndexes[overlap - 1] + 1).joinToString(" ")
             }
         }
-
         return incoming
     }
 
-    private fun cleanWords(text: String): List<String> {
-        return text.lowercase(Locale.ROOT)
-            .replace(Regex("[^a-z0-9\\s]"), "")
-            .split(Regex("\\s+"))
-            .filter { it.isNotEmpty() }
-    }
+    private fun comparableWords(text: String): List<String> =
+        text.split(WHITESPACE).map(::comparableForm).filter { it.isNotEmpty() }
 
-    /**
-     * Returns the combined confirmed text so far.
-     */
+    private fun comparableForm(word: String): String =
+        word.lowercase(Locale.ROOT).replace(NON_WORD_CHARACTERS, "")
+
     fun getConfirmedText(): String {
         synchronized(lock) {
-            return confirmedSegments.joinToString(" ") { it.text }
+            val builder = StringBuilder()
+            confirmedSegments.forEachIndexed { index, segment ->
+                if (index > 0) builder.append(if (segment.startsParagraph) "\n\n" else " ")
+                builder.append(segment.text)
+            }
+            return builder.toString()
         }
     }
 
-    /**
-     * Returns current live partial text.
-     */
     fun getCurrentPartial(): String {
+        synchronized(lock) { return currentPartial }
+    }
+
+    fun getSegmentCount(): Int {
+        synchronized(lock) { return confirmedSegments.size }
+    }
+
+    fun getSegments(): List<TimedSegment> = getSegmentsFrom(0)
+
+    fun getSegmentsFrom(index: Int): List<TimedSegment> {
         synchronized(lock) {
-            return currentPartial
+            if (index >= confirmedSegments.size) return emptyList()
+            return ArrayList(confirmedSegments.subList(index, confirmedSegments.size))
         }
     }
 
-    /**
-     * Returns all confirmed segments with timestamps.
-     */
-    fun getSegments(): List<TimedSegment> {
+    /** Returns the live partial as it should appear after the confirmed text. */
+    fun getFormattedPartial(silenceDurationMs: Long = 0L): String {
         synchronized(lock) {
-            return ArrayList(confirmedSegments)
+            if (currentPartial.isEmpty()) return ""
+            val partial = deduplicateLocked(currentPartial)
+            if (partial.isEmpty()) return ""
+            return formatter.formatText(partial, isFinal = false, silenceDurationMs = silenceDurationMs)
         }
     }
 
-    /**
-     * Generates the combined full formatted text:
-     * Confirmed text + formatted live partial hypothesis.
-     */
     fun getFormattedFullText(silenceDurationMs: Long = 0L): String {
         synchronized(lock) {
             val confirmed = getConfirmedText()
-            if (currentPartial.isEmpty()) {
-                return confirmed
-            }
-
-            // Deduplicate partial against last confirmed segment
-            val dedupPartial = deduplicateOverlap(currentPartial)
-            if (dedupPartial.isEmpty()) return confirmed
-
-            val formattedPartial = formatter.formatText(dedupPartial, isFinal = false, silenceDurationMs = silenceDurationMs)
-
-            return if (confirmed.isEmpty()) {
-                formattedPartial
-            } else {
-                "$confirmed $formattedPartial"
+            val partial = getFormattedPartial(silenceDurationMs)
+            return when {
+                partial.isEmpty() -> confirmed
+                confirmed.isEmpty() -> partial
+                else -> "$confirmed $partial"
             }
         }
+    }
+
+    private companion object {
+        val WHITESPACE = Regex("\\s+")
+        val NON_WORD_CHARACTERS = Regex("[^\\p{L}\\p{N}]")
+        const val MAX_OVERLAP_WORDS = 6
+        const val PARAGRAPH_SILENCE_MS = 3500L
     }
 }

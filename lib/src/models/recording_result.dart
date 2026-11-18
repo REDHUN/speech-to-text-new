@@ -18,6 +18,11 @@ class RecordingResult {
   /// Audio channels (1 for mono).
   final int channels;
 
+  /// The error code that ended the recording early, or null after a normal stop.
+  ///
+  /// Audio captured before the failure is still saved at [audioPath].
+  final String? failureCode;
+
   const RecordingResult({
     required this.audioPath,
     required this.transcription,
@@ -25,7 +30,11 @@ class RecordingResult {
     required this.fileSizeBytes,
     required this.sampleRate,
     required this.channels,
+    this.failureCode,
   });
+
+  /// Whether any audio was captured.
+  bool get hasAudio => duration > Duration.zero;
 
   factory RecordingResult.fromMap(Map<dynamic, dynamic> map) {
     final durationMs = (map['durationMs'] as num?)?.toInt() ?? 0;
@@ -36,6 +45,7 @@ class RecordingResult {
       fileSizeBytes: (map['fileSizeBytes'] as num?)?.toInt() ?? 0,
       sampleRate: (map['sampleRate'] as num?)?.toInt() ?? 16000,
       channels: (map['channels'] as num?)?.toInt() ?? 1,
+      failureCode: map['failureCode'] as String?,
     );
   }
 
@@ -47,10 +57,11 @@ class RecordingResult {
       'fileSizeBytes': fileSizeBytes,
       'sampleRate': sampleRate,
       'channels': channels,
+      'failureCode': failureCode,
     };
   }
 
   @override
   String toString() =>
-      'RecordingResult(path: "$audioPath", duration: $duration, size: $fileSizeBytes bytes, text: "$transcription")';
+      'RecordingResult(path: "$audioPath", duration: $duration, size: $fileSizeBytes bytes, failure: $failureCode, text: "$transcription")';
 }

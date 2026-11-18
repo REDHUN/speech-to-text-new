@@ -1,6 +1,6 @@
 # LiveSpeechRecorder (`live_speech_recorder`)
 
-A production-ready Flutter plugin for Android that provides **simultaneous single-microphone lossless WAV audio recording** and **real-time live speech-to-text transcription**.
+A Flutter plugin for **Android 13 (API 33) and newer** that provides **simultaneous single-microphone lossless WAV audio recording** and **real-time live speech-to-text transcription**.
 
 Designed specifically for educational exams, oral assessments, interview platforms, voice notes, and long-form spoken answers where users speak continuously while the application captures clean audio and displays live transcription.
 
@@ -34,30 +34,32 @@ Traditional speech-to-text solutions on Android attempt to open an independent m
    (AudioRecord) ─── Single 16 kHz, 16-bit Mono PCM Capture
         │
  [PcmAudioDistributor]
-   ├── Direct Disk Pipe ────────► [WavFileWriter] ──────► [Persistent .WAV File]
+   ├── Bounded Writer Queue ────► [WavFileWriter] ──────► [Persistent .WAV File]
    │
-   └── Decoupled Ring Buffer ───► [Speech Recognizer] ──► [Live Transcription Streams]
+   └── Bounded Audio Queue ─────► [Speech Recognizer] ──► [Live Transcription Streams]
 ```
 
-- **Zero Blocking**: Disk writes take priority on dedicated threads. Slow speech recognition will never cause audio frame drops.
-- **Audio Source Injection**: On Android 13+ (API 33+), PCM is directly piped into Android's `SpeechRecognizer` using `ParcelFileDescriptor` via `RecognizerIntent.EXTRA_AUDIO_SOURCE`.
-- **Fallback Stream Engine**: On devices where audio injection or Google speech services are unavailable, the plugin falls back to its internal PCM stream processor without opening a second microphone.
+- **Isolated Paths**: Capture, disk writes and recognition each run on their own threads, so a slow recognizer cannot delay the recording. If storage fails or cannot keep up, the recording ends with a fatal error and keeps its audio.
+- **Audio Source Injection**: PCM is piped into Android's `SpeechRecognizer` using `RecognizerIntent.EXTRA_AUDIO_SOURCE`.
+- **Injection Check**: Some recognition services may ignore injected audio. If one stops reading it, the plugin ends that recognition session and reports `AUDIO_INJECTION_UNSUPPORTED`. Audio recording continues.
 
 ---
 
 ## Key Features
 
 - **Simultaneous Capture**: Record standard lossless 16 kHz Mono WAV audio while transcribing speech in real-time from the same microphone.
-- **Continuous Long-Form Speech**: Automatically handles Android SpeechRecognizer silence timeouts and session restarts without interrupting WAV recording.
-- **Boundary Deduplication**: Uses suffix-prefix overlap algorithms so repeated words across session restarts are eliminated.
-- **Intelligent Formatting**:
-  - Sentence boundary punctuation (`.`, `?`)
-  - Auto-capitalization of sentences and standalone pronouns
+- **Continuous Long-Form Speech**: Keeps one recognition session open where supported, and restarts with backoff when needed, without interrupting WAV recording.
+- **Background Recording**: A microphone foreground service keeps capture running when the app leaves the screen.
+- **Crash-Tolerant Files**: WAV headers are refreshed during recording, and `listRecordings()` repairs interrupted files.
+- **Boundary Deduplication**: Removes words repeated when audio is replayed into a restarted session.
+- **Conservative English Formatting**:
+  - Keeps punctuation supplied by the recognizer
+  - Adds sentence endings and capitalization when it is missing
   - Acronym preservation (e.g., API, SDK, AI)
-  - Paragraph formatting based on natural speech pauses (VAD)
+  - Paragraph breaks after long pauses
 - **Offline / On-Device Recognition**: Supports `offlineOnly`, `onlineAllowed`, and `automatic` recognition modes.
-- **Integrated Audio Player**: Native player with real-time progress polling, seek control, and variable playback speeds (0.5x to 2.0x).
-- **Persistent Storage**: Saves audio files securely in `context.filesDir/recordings/` to prevent OS cache clearers from removing user recordings.
+- **Integrated Audio Player**: Native player with a progress stream, seek control, audio focus handling, and variable playback speeds (0.5x to 2.0x).
+- **Managed Storage**: Saves audio in `context.filesDir/recordings/`, with APIs to list and delete recordings.
 
 ---
 
@@ -98,37 +100,24 @@ flutter pub get
 
 ### 1. Permissions (`AndroidManifest.xml`)
 
-Open `android/app/src/main/AndroidManifest.xml` and add the following inside the `<manifest>` tag:
+The plugin adds `RECORD_AUDIO`, the microphone foreground service permissions, and the speech service query automatically. To show the background recording notification, add this to `android/app/src/main/AndroidManifest.xml` and request the permission at runtime:
 
 ```xml
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-    <!-- Microphone and Network Permissions -->
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.INTERNET" />
-
-    <!-- Query Android Speech Recognition Services (Required on Android 11+ / API 30+) -->
-    <queries>
-        <intent>
-            <action android:name="android.speech.RecognitionService" />
-        </intent>
-    </queries>
-
-    <application ...>
-        ...
-    </application>
-</manifest>
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 ```
+
+Apps published on Google Play must declare their microphone foreground service use in Play Console. To opt out, pass `enableBackgroundRecording: false` to `initialize()`. Android then silences the microphone while the app is in the background, and the plugin reports `MIC_SILENCED`.
 
 ### 2. Android SDK Requirements
 
-Open `android/app/build.gradle` (or `android/app/build.gradle.kts`) and verify the minimum SDK version:
+Open `android/app/build.gradle` (or `android/app/build.gradle.kts`) and set the minimum SDK version:
 
 ```groovy
 android {
+    compileSdk 36
+
     defaultConfig {
-        minSdkVersion 24 // Android 7.0 or higher
-        compileSdkVersion 34 // Android 14+ recommended
+        minSdk 33 // Android 13 or higher
     }
 }
 ```
@@ -193,14 +182,16 @@ recorder.durationStream.listen((duration) {
 
 // Listen to errors
 recorder.errorStream.listen((error) {
-  print('Error [${error.code}]: ${error.message}');
+  // isFatal means the recording has ended. Its audio is still saved.
+  print('Error [${error.code}] fatal=${error.isFatal}: ${error.message}');
 });
 ```
 
 ### Step 4: Record, Stop, and Play
 
 ```dart
-// Start recording audio and transcribing
+// Start recording audio and transcribing.
+// Throws SpeechRecorderException if the microphone cannot be opened.
 final audioFilePath = await recorder.start();
 
 // Pause / Resume if needed
@@ -459,21 +450,27 @@ class _SpeechRecorderScreenState extends State<SpeechRecorderScreen> {
 | Method | Return Type | Description |
 | :--- | :--- | :--- |
 | `checkCapabilities()` | `Future<RecognitionCapability>` | Inspects device support for SpeechRecognizer, audio source injection, and offline speech recognition. |
-| `initialize({...})` | `Future<bool>` | Configures language (`language`), sample rate (`sampleRate`), recognition mode (`recognitionMode`), punctuation, and segmentation. |
-| `start({String? outputPath})` | `Future<String>` | Starts single-mic capture, begins writing WAV file, and starts live transcription. Returns the WAV output path. |
-| `pause()` | `Future<bool>` | Temporarily pauses audio capture and speech recognition. |
-| `resume()` | `Future<bool>` | Resumes capture and transcription from where it was paused. |
-| `stop()` | `Future<RecordingResult>` | Finalizes the WAV header, stops recognition, and returns `RecordingResult`. |
-| `cancel()` | `Future<bool>` | Cancels the active recording session and discards the in-progress audio file. |
-| `play({String? filePath})` | `Future<bool>` | Starts playback of the recorded WAV audio file. |
+| `initialize({...})` | `Future<bool>` | Configures language, sample rate, recognition mode, punctuation, segmentation, and background recording. Throws during a recording. |
+| `start({String? outputPath})` | `Future<String>` | Opens the microphone, begins the WAV file and transcription, and returns the WAV path. Throws if capture cannot start. |
+| `pause()` | `Future<bool>` | Pauses recording and closes the microphone. Returns `false` if not recording. |
+| `resume()` | `Future<bool>` | Reopens the microphone and continues. Returns `false` if not paused. |
+| `stop()` | `Future<RecordingResult>` | Finalizes the WAV file and transcript. Repeated calls return the same result. |
+| `cancel()` | `Future<bool>` | Discards the active recording and its file. Returns `false` if none is active. |
+| `getRecordingState()` | `Future<RecordingState>` | Returns the current recording state. |
+| `getPlaybackState()` | `Future<PlaybackState>` | Returns the current playback state. |
+| `listRecordings()` | `Future<List<SavedRecording>>` | Lists saved recordings, newest first, repairing interrupted files. |
+| `deleteRecording(String path)` | `Future<bool>` | Deletes a recording from the plugin's directory. |
+| `play({String? filePath})` | `Future<bool>` | Starts playback of a WAV file. Throws during a recording. |
 | `pausePlayback()` | `Future<bool>` | Pauses audio playback. |
-| `resumePlayback()` | `Future<bool>` | Resumes paused audio playback. |
-| `stopPlayback()` | `Future<bool>` | Stops audio playback and resets position to 0. |
-| `seekTo(Duration position)` | `Future<bool>` | Seeks playback to the specified duration. |
-| `setPlaybackSpeed(double speed)` | `Future<bool>` | Adjusts playback speed (e.g. `0.8`, `1.0`, `1.25`, `1.5`, `2.0`). |
+| `resumePlayback()` | `Future<bool>` | Resumes paused or completed playback. |
+| `stopPlayback()` | `Future<bool>` | Stops audio playback and releases the player. |
+| `seekTo(Duration position)` | `Future<bool>` | Seeks playback to the specified position once audio has loaded. |
+| `setPlaybackSpeed(double speed)` | `Future<bool>` | Sets playback speed from `0.5` to `2.0`. The speed carries over to later playback. |
 | `getPlaybackPosition()` | `Future<Duration>` | Returns the current playback position. |
-| `getPlaybackDuration()` | `Future<Duration>` | Returns the total duration of the currently loaded audio file. |
-| `dispose()` | `Future<bool>` | Cleans up native audio capture, speech recognition, and player resources. |
+| `getPlaybackDuration()` | `Future<Duration>` | Returns the duration of the loaded audio file. |
+| `dispose()` | `Future<bool>` | Finalizes any active recording, keeps its file, and releases native resources. |
+
+All methods report failures by throwing `SpeechRecorderException`.
 
 ---
 
@@ -482,11 +479,12 @@ class _SpeechRecorderScreenState extends State<SpeechRecorderScreen> {
 | Stream | Type | Description |
 | :--- | :--- | :--- |
 | `transcriptionStream` | `Stream<TranscriptionResult>` | Real-time speech transcription (contains `fullText`, `partialText`, `confirmedText`, `segments`). |
-| `recordingStateStream` | `Stream<RecordingState>` | Lifecycle states: `uninitialized`, `recording`, `paused`, `stopped`. |
-| `playbackStateStream` | `Stream<PlaybackState>` | Player states: `idle`, `playing`, `paused`, `completed`, `error`. |
+| `recordingStateStream` | `Stream<RecordingState>` | Lifecycle states: `uninitialized`, `idle`, `recording`, `paused`, `stopped`, `error`. Starts with the current state. |
+| `playbackStateStream` | `Stream<PlaybackState>` | Player states: `idle`, `playing`, `paused`, `completed`, `error`. Starts with the current state. |
+| `playbackProgressStream` | `Stream<PlaybackProgress>` | Playback position and duration while audio plays. |
 | `amplitudeStream` | `Stream<double>` | Real-time RMS volume normalized from `0.0` to `1.0` for visualizers. |
-| `durationStream` | `Stream<Duration>` | Active elapsed recording duration. |
-| `errorStream` | `Stream<SpeechRecorderException>` | Stream of fatal and non-fatal errors with `code` and `message`. |
+| `durationStream` | `Stream<Duration>` | Length of the audio recorded so far, excluding pauses. |
+| `errorStream` | `Stream<SpeechRecorderException>` | Errors and warnings with `code`, `message`, and `isFatal`. |
 
 ---
 
@@ -506,10 +504,17 @@ class _SpeechRecorderScreenState extends State<SpeechRecorderScreen> {
 - `int fileSizeBytes`: File size in bytes.
 - `int sampleRate`: PCM sample rate (default 16000 Hz).
 - `int channels`: Audio channel count (1 for mono).
+- `String? failureCode`: The error that ended the recording early, if any.
+- `bool hasAudio`: Whether any audio was captured.
+
+#### `SpeechRecorderException`
+- `String code`: Stable error identifier, such as `MIC_BUSY` or `DISK_WRITE_FAILED`.
+- `String message`: Human-readable explanation.
+- `bool isFatal`: True when the error ended the recording. Audio captured so far is kept, and `stop()` returns it.
 
 #### `RecognitionMode`
-- `RecognitionMode.automatic`: Prefers on-device offline recognition when available, falls back to online recognition.
-- `RecognitionMode.offlineOnly`: Strictly requires on-device speech models (fails gracefully if offline language pack is missing).
+- `RecognitionMode.automatic`: Uses on-device recognition when the language is installed, otherwise online recognition.
+- `RecognitionMode.offlineOnly`: Never uses online recognition. If the language pack is missing, audio is still recorded and `OFFLINE_UNAVAILABLE` is reported.
 - `RecognitionMode.onlineAllowed`: Uses cloud/network speech recognition.
 
 ---
@@ -517,7 +522,7 @@ class _SpeechRecorderScreenState extends State<SpeechRecorderScreen> {
 ## Troubleshooting & Best Practices
 
 ### 1. Always Stop Recording Before Playing Audio
-Attempting to play audio while recording is still active can cause acoustic feedback loops. Always call `await recorder.stop()` before calling `await recorder.play()`.
+Playing audio during a recording would feed it back into the microphone, so `play()` throws `RECORDING_ACTIVE`. Call `await recorder.stop()` first.
 
 ### 2. Guard Stale UI State
 When starting a new recording, clear your UI's previous `RecordingResult` or hide the playback controls until `stop()` is called.
@@ -526,6 +531,10 @@ When starting a new recording, clear your UI's previous `RecordingResult` or hid
 When testing on an Android Virtual Device (AVD):
 - Open **AVD Settings** -> **Virtual Microphone** and ensure **Host audio input** is enabled.
 - Google Play speech recognition requires an internet connection on emulators unless an on-device offline language pack is downloaded.
+- The emulator's virtual microphone can fail with `pcm_readi` I/O errors in logcat. The plugin reports `MIC_INPUT_LOST` and reconnects, but speech during each dropout is lost. Use a physical device to judge transcription quality.
 
 ### 4. Handling Missing Permissions
-If you do not request microphone permission before calling `start()`, `SpeechRecorderException` with code `PERMISSION_DENIED` will be emitted via `errorStream`. Always request permission with `permission_handler` first.
+If microphone permission has not been granted, `start()` throws `SpeechRecorderException` with code `PERMISSION_DENIED`. Always request permission with `permission_handler` first.
+
+### 5. Start Recording While the App Is Visible
+Android only allows the microphone foreground service to start from the foreground. If it cannot start, recording continues and `BACKGROUND_RECORDING_UNAVAILABLE` is reported.

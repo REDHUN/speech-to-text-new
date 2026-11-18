@@ -1,8 +1,9 @@
 /// Speech recognition operating mode.
 enum RecognitionMode {
   /// Strict offline-only recognition.
-  /// Throws an error if on-device speech recognition models are unavailable.
-  /// Never uploads student audio to network servers.
+  /// If the on-device model for the language is missing, audio is still
+  /// recorded and `OFFLINE_UNAVAILABLE` is sent through the error stream.
+  /// Never uses a network recognizer.
   offlineOnly,
 
   /// Permits online cloud recognition if network is available.

@@ -31,16 +31,11 @@ class LiveSpeechRecorderViewModel extends ChangeNotifier {
   String _selectedLanguage = 'en-IN';
   RecognitionMode _selectedMode = RecognitionMode.automatic;
   double _playbackSpeed = 1.0;
-
-  Timer? _playbackProgressTimer;
+  bool _isStarting = false;
+  bool _isDisposed = false;
 
   // Stream Subscriptions
-  StreamSubscription<TranscriptionResult>? _transcriptionSub;
-  StreamSubscription<RecordingState>? _recordingStateSub;
-  StreamSubscription<PlaybackState>? _playbackStateSub;
-  StreamSubscription<double>? _amplitudeSub;
-  StreamSubscription<Duration>? _durationSub;
-  StreamSubscription<SpeechRecorderException>? _errorSub;
+  final List<StreamSubscription<Object?>> _subscriptions = [];
 
   // Getters
   RecordingState get recordingState => _recordingState;
@@ -61,6 +56,7 @@ class LiveSpeechRecorderViewModel extends ChangeNotifier {
   RecognitionMode get selectedMode => _selectedMode;
   double get playbackSpeed => _playbackSpeed;
 
+  bool get isStarting => _isStarting;
   bool get isRecording => _recordingState == RecordingState.recording;
   bool get isPaused => _recordingState == RecordingState.paused;
   bool get isPlaying => _playbackState == PlaybackState.playing;
@@ -70,231 +66,212 @@ class LiveSpeechRecorderViewModel extends ChangeNotifier {
     checkCapabilities();
   }
 
+  void _notify() {
+    if (!_isDisposed) notifyListeners();
+  }
+
+  void _showError(Object error) {
+    _errorMessage = error is SpeechRecorderException
+        ? '${error.code}: ${error.message}'
+        : error.toString();
+    _notify();
+  }
+
   void _initSubscribers() {
-    _transcriptionSub = _recorder.transcriptionStream.listen((result) {
-      _fullTranscription = result.fullText;
-      _partialTranscription = result.partialText;
-      _confirmedTranscription = result.confirmedText;
-      _segments = result.segments;
-      notifyListeners();
-    });
+    _subscriptions.addAll([
+      _recorder.transcriptionStream.listen((result) {
+        _fullTranscription = result.fullText;
+        _partialTranscription = result.partialText;
+        _confirmedTranscription = result.confirmedText;
+        _segments = result.segments;
+        _notify();
+      }),
+      _recorder.recordingStateStream.listen((state) {
+        _recordingState = state;
+        _notify();
+        if (state == RecordingState.error) _loadResultAfterFailure();
+      }),
+      _recorder.playbackStateStream.listen((state) {
+        _playbackState = state;
+        if (state == PlaybackState.idle) _playbackPosition = Duration.zero;
+        _notify();
+      }),
+      _recorder.playbackProgressStream.listen((progress) {
+        _playbackPosition = progress.position;
+        if (progress.duration > Duration.zero) {
+          _playbackDuration = progress.duration;
+        }
+        _notify();
+      }),
+      _recorder.amplitudeStream.listen((amp) {
+        _currentAmplitude = amp;
+        _amplitudeHistory.removeAt(0);
+        _amplitudeHistory.add(amp.clamp(0.05, 1.0));
+        _notify();
+      }),
+      _recorder.durationStream.listen((dur) {
+        _recordingDuration = dur;
+        _notify();
+      }),
+      _recorder.errorStream.listen((error) {
+        if (error.code == 'MIC_RESTORED') {
+          clearError();
+        } else {
+          _showError(error);
+        }
+      }),
+    ]);
+  }
 
-    _recordingStateSub = _recorder.recordingStateStream.listen((state) {
-      _recordingState = state;
-      notifyListeners();
-    });
+  /// A fatal error ends the recording, but the audio captured so far is saved.
+  Future<void> _loadResultAfterFailure() async {
+    try {
+      _applyResult(await _recorder.stop());
+    } on SpeechRecorderException catch (e) {
+      _showError(e);
+    }
+  }
 
-    _playbackStateSub = _recorder.playbackStateStream.listen((state) {
-      _playbackState = state;
-      if (state == PlaybackState.playing) {
-        _startPlaybackPoller();
-      } else {
-        _stopPlaybackPoller();
-      }
-      notifyListeners();
-    });
+  void _applyResult(RecordingResult result) {
+    _lastResult = result;
+    _fullTranscription = result.transcription;
+    _partialTranscription = '';
+    _recordingDuration = result.duration;
+    _playbackDuration = result.duration;
+    _playbackPosition = Duration.zero;
+    _notify();
+  }
 
-    _amplitudeSub = _recorder.amplitudeStream.listen((amp) {
-      _currentAmplitude = amp;
-      _amplitudeHistory.removeAt(0);
-      _amplitudeHistory.add(amp.clamp(0.05, 1.0));
-      notifyListeners();
-    });
-
-    _durationSub = _recorder.durationStream.listen((dur) {
-      _recordingDuration = dur;
-      notifyListeners();
-    });
-
-    _errorSub = _recorder.errorStream.listen((err) {
-      _errorMessage = '${err.code}: ${err.message}';
-      notifyListeners();
-    });
+  void _clearSession() {
+    _lastResult = null;
+    _fullTranscription = '';
+    _partialTranscription = '';
+    _confirmedTranscription = '';
+    _segments = [];
+    _recordingDuration = Duration.zero;
+    _playbackPosition = Duration.zero;
+    _playbackDuration = Duration.zero;
+    _amplitudeHistory.fillRange(0, _amplitudeHistory.length, 0.05);
   }
 
   Future<void> checkCapabilities() async {
     try {
       _capability = await _recorder.checkCapabilities();
-      notifyListeners();
-    } catch (e) {
-      _errorMessage = 'Failed to check capabilities: $e';
-      notifyListeners();
+      _notify();
+    } on SpeechRecorderException catch (e) {
+      _showError(e);
     }
   }
 
   void setLanguage(String lang) {
     if (_selectedLanguage != lang) {
       _selectedLanguage = lang;
-      notifyListeners();
+      _notify();
     }
   }
 
   void setRecognitionMode(RecognitionMode mode) {
     if (_selectedMode != mode) {
       _selectedMode = mode;
-      notifyListeners();
+      _notify();
     }
   }
 
   Future<void> startRecording() async {
-    try {
-      _errorMessage = null;
+    if (_isStarting || isRecording || isPaused) return;
 
+    _isStarting = true;
+    _errorMessage = null;
+    _notify();
+
+    try {
       final status = await Permission.microphone.request();
       if (!status.isGranted) {
         _errorMessage = 'Microphone permission was denied. Please grant microphone access to record audio.';
-        notifyListeners();
         return;
       }
+      // Without this, the background recording notification stays hidden.
+      await Permission.notification.request();
 
-      _lastResult = null;
-      _fullTranscription = '';
-      _partialTranscription = '';
-      _confirmedTranscription = '';
-      _segments = [];
-      _recordingDuration = Duration.zero;
-      _playbackPosition = Duration.zero;
-      _playbackDuration = Duration.zero;
-      _amplitudeHistory.fillRange(0, _amplitudeHistory.length, 0.05);
-
+      _clearSession();
       await _recorder.initialize(
         language: _selectedLanguage,
         sampleRate: 16000,
         recognitionMode: _selectedMode,
         enablePunctuation: true,
         enableSegmented: true,
+        notificationTitle: 'Live Speech Recorder',
+        notificationText: 'Recording your answer',
       );
-
       await _recorder.start();
-    } catch (e) {
-      _errorMessage = 'Start recording error: $e';
-      notifyListeners();
+    } on SpeechRecorderException catch (e) {
+      _showError(e);
+    } finally {
+      _isStarting = false;
+      _notify();
     }
   }
 
-  Future<void> pauseRecording() async {
+  Future<void> _run(Future<void> Function() action) async {
     try {
-      await _recorder.pause();
-    } catch (e) {
-      _errorMessage = 'Pause error: $e';
-      notifyListeners();
+      await action();
+    } on SpeechRecorderException catch (e) {
+      _showError(e);
     }
   }
 
-  Future<void> resumeRecording() async {
-    try {
-      await _recorder.resume();
-    } catch (e) {
-      _errorMessage = 'Resume error: $e';
-      notifyListeners();
-    }
-  }
+  Future<void> pauseRecording() => _run(_recorder.pause);
 
-  Future<void> stopRecording() async {
-    try {
-      final result = await _recorder.stop();
-      _lastResult = result;
-      _fullTranscription = result.transcription;
-      _recordingDuration = result.duration;
-      _playbackDuration = result.duration;
-      _playbackPosition = Duration.zero;
-      notifyListeners();
-    } catch (e) {
-      _errorMessage = 'Stop error: $e';
-      notifyListeners();
-    }
-  }
+  Future<void> resumeRecording() => _run(_recorder.resume);
 
-  Future<void> cancelRecording() async {
-    try {
-      await _recorder.cancel();
-      _lastResult = null;
-      _fullTranscription = '';
-      _partialTranscription = '';
-      _confirmedTranscription = '';
-      _segments = [];
-      _recordingDuration = Duration.zero;
-      _playbackPosition = Duration.zero;
-      _playbackDuration = Duration.zero;
-      _amplitudeHistory.fillRange(0, _amplitudeHistory.length, 0.05);
-      notifyListeners();
-    } catch (e) {
-      _errorMessage = 'Cancel error: $e';
-      notifyListeners();
-    }
-  }
+  Future<void> stopRecording() => _run(() async {
+        _applyResult(await _recorder.stop());
+      });
+
+  Future<void> cancelRecording() => _run(() async {
+        await _recorder.cancel();
+        _clearSession();
+        _notify();
+      });
 
   // Playback Operations
-  Future<void> playAudio() async {
-    try {
-      if (isRecording || isPaused) {
-        _errorMessage = 'Please stop recording before playing audio.';
-        notifyListeners();
-        return;
-      }
-      if (_lastResult != null) {
-        await _recorder.play(filePath: _lastResult!.audioPath);
-        _playbackDuration = await _recorder.getPlaybackDuration();
-      } else {
-        _errorMessage = 'No recorded audio available to play.';
-        notifyListeners();
-      }
-    } catch (e) {
-      _errorMessage = 'Play error: $e';
-      notifyListeners();
-    }
-  }
+  Future<void> playAudio() => _run(() async {
+        if (isRecording || isPaused) {
+          _errorMessage = 'Please stop recording before playing audio.';
+          _notify();
+          return;
+        }
+        final result = _lastResult;
+        if (result == null) {
+          _errorMessage = 'No recorded audio available to play.';
+          _notify();
+          return;
+        }
+        if (_playbackState == PlaybackState.paused) {
+          await _recorder.resumePlayback();
+        } else {
+          await _recorder.play(filePath: result.audioPath);
+        }
+      });
 
-  Future<void> pauseAudio() async {
-    try {
-      await _recorder.pausePlayback();
-    } catch (e) {
-      _errorMessage = 'Pause playback error: $e';
-      notifyListeners();
-    }
-  }
+  Future<void> pauseAudio() => _run(_recorder.pausePlayback);
 
-  Future<void> resumeAudio() async {
-    try {
-      await _recorder.resumePlayback();
-    } catch (e) {
-      _errorMessage = 'Resume playback error: $e';
-      notifyListeners();
-    }
-  }
+  Future<void> resumeAudio() => _run(_recorder.resumePlayback);
 
-  Future<void> stopAudio() async {
-    try {
-      await _recorder.stopPlayback();
-      _playbackPosition = Duration.zero;
-      notifyListeners();
-    } catch (e) {
-      _errorMessage = 'Stop playback error: $e';
-      notifyListeners();
-    }
-  }
+  Future<void> stopAudio() => _run(_recorder.stopPlayback);
 
-  Future<void> seekAudio(Duration position) async {
-    try {
-      await _recorder.seekTo(position);
-      _playbackPosition = position;
-      notifyListeners();
-    } catch (e) {
-      _errorMessage = 'Seek error: $e';
-      notifyListeners();
-    }
-  }
+  Future<void> seekAudio(Duration position) => _run(() async {
+        if (await _recorder.seekTo(position)) {
+          _playbackPosition = position;
+          _notify();
+        }
+      });
 
-  Future<void> setPlaybackSpeed(double speed) async {
-    try {
-      await _recorder.setPlaybackSpeed(speed);
-      _playbackSpeed = speed;
-      notifyListeners();
-    } catch (e) {
-      _errorMessage = 'Set speed error: $e';
-      notifyListeners();
-    }
-  }
+  Future<void> setPlaybackSpeed(double speed) => _run(() async {
+        await _recorder.setPlaybackSpeed(speed);
+        _playbackSpeed = speed;
+        _notify();
+      });
 
   void copyTranscriptionToClipboard() {
     if (_fullTranscription.isNotEmpty) {
@@ -304,40 +281,15 @@ class LiveSpeechRecorderViewModel extends ChangeNotifier {
 
   void clearError() {
     _errorMessage = null;
-    notifyListeners();
-  }
-
-  void _startPlaybackPoller() {
-    _stopPlaybackPoller();
-    _playbackProgressTimer = Timer.periodic(const Duration(milliseconds: 200), (_) async {
-      try {
-        final pos = await _recorder.getPlaybackPosition();
-        final dur = await _recorder.getPlaybackDuration();
-        _playbackPosition = pos;
-        if (dur > Duration.zero) {
-          _playbackDuration = dur;
-        }
-        notifyListeners();
-      } catch (e) {
-        // Poller error suppressed during player transitions
-      }
-    });
-  }
-
-  void _stopPlaybackPoller() {
-    _playbackProgressTimer?.cancel();
-    _playbackProgressTimer = null;
+    _notify();
   }
 
   @override
   void dispose() {
-    _stopPlaybackPoller();
-    _transcriptionSub?.cancel();
-    _recordingStateSub?.cancel();
-    _playbackStateSub?.cancel();
-    _amplitudeSub?.cancel();
-    _durationSub?.cancel();
-    _errorSub?.cancel();
+    _isDisposed = true;
+    for (final subscription in _subscriptions) {
+      subscription.cancel();
+    }
     _recorder.dispose();
     super.dispose();
   }

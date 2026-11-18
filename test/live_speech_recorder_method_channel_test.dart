@@ -81,7 +81,97 @@ void main() {
     expect(cap.hasSpeechRecognizer, isTrue);
     expect(cap.supportsAudioSourceInjection, isTrue);
     expect(cap.supportsOfflineRecognition, isTrue);
-    expect(cap.recommendedMode, 'offlineOnly');
+    expect(cap.recommendedMode, RecognitionMode.offlineOnly);
+  });
+
+  test('native failures become SpeechRecorderException', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
+      throw PlatformException(code: 'MIC_BUSY', message: 'busy');
+    });
+
+    await expectLater(
+      platform.start(),
+      throwsA(
+        isA<SpeechRecorderException>()
+            .having((e) => e.code, 'code', 'MIC_BUSY')
+            .having((e) => e.message, 'message', 'busy'),
+      ),
+    );
+  });
+
+  test('error events carry the fatal flag', () {
+    final error = SpeechRecorderException.fromMap(const {
+      'code': 'DISK_WRITE_FAILED',
+      'message': 'full',
+      'isFatal': true,
+    });
+    expect(error.isFatal, isTrue);
+  });
+
+  test('recording results expose failure details', () {
+    final result = RecordingResult.fromMap(const {
+      'audioPath': 'a.wav',
+      'durationMs': 0,
+      'failureCode': 'CAPTURE_FAILED',
+    });
+    expect(result.failureCode, 'CAPTURE_FAILED');
+    expect(result.hasAudio, isFalse);
+  });
+
+  test('recording state understands the error state', () {
+    expect(RecordingState.fromWireString('ERROR'), RecordingState.error);
+  });
+
+  test('transcript is assembled from incremental updates', () async {
+    const eventChannel = EventChannel('com.livespeechrecorder/transcription');
+    Map<String, Object?> segment(String text, {bool paragraph = false}) => {
+          'text': text,
+          'startTimeMs': 0,
+          'endTimeMs': 10,
+          'confidence': null,
+          'isFinal': true,
+          'startsParagraph': paragraph,
+        };
+
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockStreamHandler(
+      eventChannel,
+      MockStreamHandler.inline(
+        onListen: (arguments, events) {
+          events.success({
+            'isReset': true,
+            'segmentStartIndex': 0,
+            'segments': [segment('First.')],
+            'partialText': 'sec',
+            'formattedPartial': 'Sec',
+            'isFinal': false,
+          });
+          events.success({
+            'isReset': false,
+            'segmentStartIndex': 1,
+            'segments': [segment('Second.', paragraph: true)],
+            'partialText': '',
+            'formattedPartial': '',
+            'isFinal': true,
+          });
+          events.endOfStream();
+        },
+      ),
+    );
+    addTearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockStreamHandler(eventChannel, null);
+    });
+
+    final results = await MethodChannelLiveSpeechRecorder().transcriptionStream.toList();
+
+    expect(results.first.fullText, 'First. Sec');
+    expect(results.first.confirmedText, 'First.');
+    expect(results.last.fullText, 'First.\n\nSecond.');
+    expect(results.last.segments, hasLength(2));
+    expect(results.last.segments.first.confidence, isNull);
+    expect(results.last.isFinal, isTrue);
   });
 
   test('initialize executes successfully', () async {

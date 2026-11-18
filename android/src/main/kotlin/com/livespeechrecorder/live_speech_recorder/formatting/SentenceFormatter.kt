@@ -3,199 +3,221 @@ package com.livespeechrecorder.live_speech_recorder.formatting
 import java.util.Locale
 
 /**
- * Intelligent sentence boundary detection, punctuation restoration, and capitalization engine.
+ * Conservative sentence formatting for recognizer output.
  *
- * Designed for educational long-form answers, essays, and explanations.
+ * Text the recognizer already punctuated keeps its punctuation. Unpunctuated English text gets
+ * capitalization and sentence endings, and is only split where a boundary is very likely.
+ * Text in other languages is returned unchanged because these rules are English-specific.
  */
 class SentenceFormatter(
     private val enablePunctuation: Boolean = true,
-    private val enableCapitalization: Boolean = true
+    private val enableCapitalization: Boolean = true,
+    language: String = "en"
 ) {
-
-    private val interrogativeWhWords = hashSetOf(
-        "who", "what", "where", "when", "why", "how", "which", "whose", "whom"
-    )
+    private val appliesEnglishRules = language.lowercase(Locale.ROOT).startsWith("en")
 
     private val questionAuxiliaries = hashSetOf(
-        "is", "are", "am", "was", "were",
-        "do", "does", "did",
-        "can", "could", "would", "should", "will", "shall",
-        "has", "have", "had", "may", "might"
+        "is", "are", "am", "was", "were", "do", "does", "did", "can", "could",
+        "would", "should", "will", "shall", "has", "have", "had", "may", "might"
     )
 
-    private val transitionPhrases = hashSetOf(
-        "however", "therefore", "furthermore", "moreover", "in addition",
-        "for example", "for instance", "firstly", "secondly", "thirdly",
-        "finally", "on the other hand", "as a result", "consequently", "meanwhile", "today"
+    private val subjectWords = hashSetOf(
+        "i", "you", "he", "she", "it", "we", "they", "this", "that", "these", "those", "there"
+    )
+
+    private val determiners = hashSetOf("the", "a", "an", "my", "your", "his", "her", "its", "our", "their")
+
+    // "do the work" and "have a nice day" are usually commands, not questions.
+    private val auxiliariesAllowingDeterminer = hashSetOf(
+        "is", "are", "was", "were", "does", "did", "can", "could", "would", "should", "will"
+    )
+
+    private val howQualifiers = hashSetOf("many", "much", "long", "far", "often", "old")
+
+    private val sentenceTransitions = listOf(
+        listOf("however"), listOf("therefore"), listOf("furthermore"), listOf("moreover"),
+        listOf("firstly"), listOf("secondly"), listOf("thirdly"), listOf("finally"),
+        listOf("consequently"), listOf("meanwhile"), listOf("in", "addition"),
+        listOf("for", "example"), listOf("for", "instance"),
+        listOf("on", "the", "other", "hand"), listOf("as", "a", "result")
+    )
+
+    private val introductoryPhrases = sentenceTransitions + listOf(listOf("today"))
+
+    // A boundary cannot follow these words: the clause is still open.
+    private val openClauseWords = hashSetOf(
+        "a", "an", "the", "and", "but", "or", "so", "then", "that", "if", "because", "when",
+        "while", "as", "is", "are", "was", "were", "be", "to", "of", "in", "on", "for", "with",
+        "what", "which", "who", "think", "know", "believe", "said", "say", "feel", "hope"
+    )
+
+    private val pronounClauseVerbs = hashSetOf(
+        "am", "was", "have", "had", "will", "would", "can", "could", "want", "think", "believe", "feel"
     )
 
     private val commonAcronyms = hashMapOf(
-        "ai" to "AI",
-        "ml" to "ML",
-        "cpu" to "CPU",
-        "ram" to "RAM",
-        "gpu" to "GPU",
-        "os" to "OS",
-        "pc" to "PC",
-        "usb" to "USB",
-        "api" to "API",
-        "url" to "URL",
-        "html" to "HTML",
-        "css" to "CSS",
-        "sdk" to "SDK",
-        "sql" to "SQL",
-        "iot" to "IoT",
-        "nlp" to "NLP",
-        "llm" to "LLM",
-        "http" to "HTTP",
-        "https" to "HTTPS",
-        "json" to "JSON",
-        "xml" to "XML"
+        "ai" to "AI", "ml" to "ML", "cpu" to "CPU", "ram" to "RAM", "gpu" to "GPU",
+        "os" to "OS", "pc" to "PC", "usb" to "USB", "api" to "API", "url" to "URL",
+        "html" to "HTML", "css" to "CSS", "sdk" to "SDK", "sql" to "SQL", "iot" to "IoT",
+        "nlp" to "NLP", "llm" to "LLM", "http" to "HTTP", "https" to "HTTPS",
+        "json" to "JSON", "xml" to "XML"
     )
 
     private val properNouns = hashSetOf(
-        // Days
         "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
-        // Months
-        "january", "february", "march", "april", "may", "june",
-        "july", "august", "september", "october", "november", "december",
-        // Tech platforms
+        "january", "february", "april", "june", "july", "september", "october", "november", "december",
         "android", "google", "flutter", "kotlin", "java", "python",
-        // Countries & regions
         "india", "america", "britain", "england", "china", "japan",
-        "germany", "france", "canada", "australia", "delhi", "mumbai", "bangalore", "london", "new york",
-        // Names common in student contexts
+        "germany", "france", "canada", "australia", "delhi", "mumbai", "bangalore", "london",
         "rahul", "priya", "amit", "rohan", "neha", "alex", "john", "sarah", "michael", "david"
     )
 
+    // These are also ordinary words, so they are capitalized only in a date-like context.
+    private val ambiguousMonths = hashSetOf("march", "may", "august")
+    private val monthContextWords = hashSetOf("in", "of", "since", "until", "from", "by", "during", "last", "next")
+
     /**
-     * Formats a raw unpunctuated text stream into sentences with proper capitalization and punctuation.
-     *
      * @param rawText Unformatted speech text.
-     * @param isFinal Whether the segment is finalized (adds closing punctuation).
-     * @param silenceDurationMs Silence duration in ms from VAD.
+     * @param isFinal Whether the text is finalized and should receive closing punctuation.
+     * @param silenceDurationMs Current silence length, used to close a live partial early.
      */
     fun formatText(rawText: String, isFinal: Boolean, silenceDurationMs: Long = 0L): String {
         val trimmed = rawText.trim()
         if (trimmed.isEmpty()) return ""
+        if (!appliesEnglishRules) return trimmed
 
-        val words = trimmed.split(Regex("\\s+")).filter { it.isNotEmpty() }
-        if (words.isEmpty()) return ""
+        val words = trimmed.split(WHITESPACE).filter { it.isNotEmpty() }
+        if (words.any { it.last() in PUNCTUATION_MARKS }) {
+            return formatPunctuatedWords(words, isFinal)
+        }
 
+        val sentences = splitIntoSentences(words)
+        return sentences.mapIndexed { index, sentence ->
+            val closed = index < sentences.lastIndex || isFinal ||
+                (silenceDurationMs >= PARTIAL_CLOSE_SILENCE_MS && sentence.size >= MIN_SENTENCE_WORDS)
+            formatSingleSentence(sentence, closed)
+        }.joinToString(" ")
+    }
+
+    private fun formatPunctuatedWords(words: List<String>, isFinal: Boolean): String {
+        var startsSentence = true
+        val result = words.mapIndexed { index, word ->
+            val core = word.trimEnd { it in PUNCTUATION_MARKS }
+            val trailing = word.substring(core.length)
+            var cased = applyWordCase(core, normalize(words.getOrNull(index - 1)), normalize(words.getOrNull(index + 1)))
+            if (startsSentence) cased = capitalizeFirst(cased)
+            startsSentence = trailing.any { it in SENTENCE_ENDINGS }
+            cased + trailing
+        }.joinToString(" ")
+
+        val needsEnding = enablePunctuation && isFinal && result.last() !in SENTENCE_ENDINGS
+        return if (needsEnding) result.trimEnd(',', ';', ':') + "." else result
+    }
+
+    private fun splitIntoSentences(words: List<String>): List<List<String>> {
         val sentences = mutableListOf<List<String>>()
-        var currentSentenceWords = mutableListOf<String>()
+        var current = mutableListOf<String>()
 
-        for (i in words.indices) {
-            val word = words[i]
-            currentSentenceWords.add(word)
-
-            val hasTrailingPunctuation = word.endsWith(".") || word.endsWith("?") || word.endsWith("!")
-            val nextWord = if (i + 1 < words.size) words[i + 1].lowercase(Locale.ROOT) else null
-            val nextNextWord = if (i + 2 < words.size) words[i + 2].lowercase(Locale.ROOT) else null
-
-            var shouldBreak = hasTrailingPunctuation
-
-            if (!shouldBreak && nextWord != null && currentSentenceWords.size >= 4) {
-                if (transitionPhrases.contains(nextWord)) {
-                    shouldBreak = true
-                } else if (nextWord == "i" && nextNextWord != null &&
-                    hashSetOf("am", "was", "have", "had", "will", "would", "can", "could", "want", "think", "believe", "feel").contains(nextNextWord)
-                ) {
-                    shouldBreak = true
-                } else if (interrogativeWhWords.contains(nextWord)) {
-                    val lastWordLower = currentSentenceWords.last().lowercase(Locale.ROOT).replace(Regex("[^a-z]"), "")
-                    val subordinateVerbs = hashSetOf(
-                        "explain", "know", "understand", "learn", "see", "show", "tell",
-                        "discuss", "hear", "wonder", "ask", "asked", "wondering"
-                    )
-                    if (!subordinateVerbs.contains(lastWordLower)) {
-                        shouldBreak = true
-                    }
-                }
-            }
-
-            if (shouldBreak) {
-                sentences.add(currentSentenceWords)
-                currentSentenceWords = mutableListOf()
+        for (index in words.indices) {
+            current.add(words[index])
+            if (current.size >= MIN_SENTENCE_WORDS && startsNewSentenceAfter(words, index)) {
+                sentences.add(current)
+                current = mutableListOf()
             }
         }
+        if (current.isNotEmpty()) sentences.add(current)
+        return sentences
+    }
 
-        if (currentSentenceWords.isNotEmpty()) {
-            sentences.add(currentSentenceWords)
-        }
+    private fun startsNewSentenceAfter(words: List<String>, index: Int): Boolean {
+        if (index + 1 >= words.size || normalize(words[index]) in openClauseWords) return false
 
-        val formattedSentences = mutableListOf<String>()
+        val next = normalize(words[index + 1])
+        val afterNext = normalize(words.getOrNull(index + 2))
+        if (next == "i" && afterNext in pronounClauseVerbs) return true
 
-        for (sIndex in sentences.indices) {
-            val sentenceWords = sentences[sIndex]
-            val isLastSentence = (sIndex == sentences.size - 1)
-            val formatAsFinal = (!isLastSentence) || isFinal || (silenceDurationMs >= 1200L && sentenceWords.size >= 4)
+        val transition = sentenceTransitions.firstOrNull { phraseMatches(words, index + 1, it) } ?: return false
+        // "in addition to that" continues the sentence.
+        return normalize(words.getOrNull(index + 1 + transition.size)) != "to"
+    }
 
-            val formatted = formatSingleSentence(sentenceWords, formatAsFinal)
-            if (formatted.isNotEmpty()) {
-                formattedSentences.add(formatted)
-            }
-        }
-
-        val separator = if (silenceDurationMs >= 3500L) "\n\n" else " "
-        return formattedSentences.joinToString(separator)
+    private fun phraseMatches(words: List<String>, start: Int, phrase: List<String>): Boolean {
+        if (start + phrase.size > words.size) return false
+        return phrase.indices.all { normalize(words[start + it]) == phrase[it] }
     }
 
     /**
-     * Formats an individual sentence list of words.
+     * Formats one sentence's words.
      */
     fun formatSingleSentence(words: List<String>, isFinal: Boolean): String {
         if (words.isEmpty()) return ""
 
-        val transformedWords = mutableListOf<String>()
+        val introLength = introductoryPhrases
+            .firstOrNull { phraseMatches(words, 0, it) }
+            ?.size
+            ?.takeIf { words.size > it + 1 }
+            ?: 0
 
-        for (i in words.indices) {
-            val rawWord = words[i]
-            var cleanWord = rawWord.trim().replace(Regex("[.,?!;:]+$"), "")
-            val lower = cleanWord.lowercase(Locale.ROOT)
+        val result = words.mapIndexed { index, word ->
+            var cleaned = applyWordCase(
+                word.trim().trimEnd { it in PUNCTUATION_MARKS },
+                normalize(words.getOrNull(index - 1)),
+                normalize(words.getOrNull(index + 1))
+            )
+            if (index == 0) cleaned = capitalizeFirst(cleaned)
+            if (enablePunctuation && index == introLength - 1) cleaned += ","
+            cleaned
+        }.filter { it.isNotEmpty() }.joinToString(" ")
 
-            // 1. Acronym check
-            val acronym = commonAcronyms[lower]
-            if (acronym != null) {
-                cleanWord = acronym
-            }
-            // 2. Standalone "I" and contractions
-            else if (lower == "i") {
-                cleanWord = "I"
-            } else if (lower.startsWith("i'") || lower.startsWith("i’")) {
-                cleanWord = "I" + cleanWord.substring(1)
-            }
-            // 3. Proper noun check
-            else if (properNouns.contains(lower)) {
-                cleanWord = cleanWord.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
-            }
-            // 4. First word capitalization
-            if (enableCapitalization && i == 0) {
-                cleanWord = cleanWord.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
-            }
+        if (!enablePunctuation || !isFinal || result.isEmpty()) return result
+        return result + if (isQuestion(words)) "?" else "."
+    }
 
-            // 5. Add comma after introductory transition word at the start of sentence
-            if (enablePunctuation && i == 0 && transitionPhrases.contains(lower) && words.size > 2) {
-                cleanWord += ","
-            }
-
-            transformedWords.add(cleanWord)
+    private fun isQuestion(words: List<String>): Boolean {
+        val first = normalize(words.first())
+        val second = normalize(words.getOrNull(1))
+        return when (first) {
+            "who", "what", "which", "whose", "whom" ->
+                second.isNotEmpty() && second !in subjectWords && second !in determiners && second != "to"
+            "when", "where", "why" -> second in questionAuxiliaries
+            "how" -> second in questionAuxiliaries || second in howQualifiers
+            in questionAuxiliaries -> words.size >= 3 && (
+                second in subjectWords ||
+                    (first in auxiliariesAllowingDeterminer && second in determiners)
+                )
+            else -> false
         }
+    }
 
-        var result = transformedWords.joinToString(" ")
-
-        // 6. Sentence ending punctuation
-        if (enablePunctuation && isFinal) {
-            val firstWordLower = words.first().lowercase(Locale.ROOT)
-            val endsWithPunct = result.endsWith(".") || result.endsWith("?") || result.endsWith("!")
-
-            if (!endsWithPunct) {
-                val isQuestion = interrogativeWhWords.contains(firstWordLower) ||
-                        (questionAuxiliaries.contains(firstWordLower) && words.size >= 3)
-                result += if (isQuestion) "?" else "."
-            }
+    private fun applyWordCase(word: String, previous: String, next: String): String {
+        val lower = word.lowercase(Locale.ROOT)
+        commonAcronyms[lower]?.let { return it }
+        return when {
+            lower == "i" -> "I"
+            lower.startsWith("i'") || lower.startsWith("i’") -> "I" + word.substring(1)
+            lower in properNouns -> capitalizeFirst(word)
+            lower in ambiguousMonths && isDateContext(previous, next) -> capitalizeFirst(word)
+            else -> word
         }
+    }
 
-        return result
+    private fun isDateContext(previous: String, next: String): Boolean =
+        previous in monthContextWords || previous.firstOrNull()?.isDigit() == true ||
+            next.firstOrNull()?.isDigit() == true
+
+    private fun capitalizeFirst(word: String): String {
+        if (!enableCapitalization) return word
+        return word.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+    }
+
+    private fun normalize(word: String?): String =
+        word?.trimEnd { it in PUNCTUATION_MARKS }?.lowercase(Locale.ROOT).orEmpty()
+
+    private companion object {
+        val WHITESPACE = Regex("\\s+")
+        const val PUNCTUATION_MARKS = ".,?!;:"
+        const val SENTENCE_ENDINGS = ".?!"
+        const val MIN_SENTENCE_WORDS = 4
+        const val PARTIAL_CLOSE_SILENCE_MS = 1200L
     }
 }

@@ -2,6 +2,7 @@ package com.livespeechrecorder.live_speech_recorder.audio
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
@@ -21,135 +22,127 @@ fun interface PcmConsumer {
 }
 
 /**
- * Thread-safe, bounded, non-blocking audio distributor.
+ * Distributes PCM from the single capture session to its consumers.
  *
- * Distributes raw PCM audio from a single AudioRecord capture session to multiple consumers:
- * 1. Audio recording pipeline (WavFileWriter) - prioritised synchronous or dedicated consumer.
- * 2. Speech recognition pipeline (SpeechRecognizer / on-device ASR) - decoupled through bounded channels.
- * 3. Amplitude / VAD analyzers.
- *
- * Ensures slow speech recognition processing NEVER blocks or drops audio in the WAV recording pipeline.
+ * Direct consumers run on the capture thread and must not block. Async consumers each get a
+ * bounded queue that drops the oldest audio, so a slow recognizer cannot delay capture.
  */
 class PcmAudioDistributor(
     private val bufferCapacity: Int = 64
 ) {
+    private class AsyncEntry(
+        val consumer: PcmConsumer,
+        val channel: Channel<ByteArray>,
+        val job: Job
+    )
+
     private val directConsumers = CopyOnWriteArrayList<PcmConsumer>()
-    private val asyncConsumers = CopyOnWriteArrayList<Pair<PcmConsumer, Channel<ByteArray>>>()
+    private val asyncConsumers = CopyOnWriteArrayList<AsyncEntry>()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     var onAmplitudeUpdated: ((normalizedRms: Double, decibels: Double) -> Unit)? = null
 
-    /**
-     * Registers a consumer to receive audio directly on the capture thread.
-     * Use this for lightweight, non-blocking consumers like WavFileWriter.
-     */
+    /** Called from the delivering thread when a consumer throws. */
+    var onConsumerError: ((Exception) -> Unit)? = null
+
     fun addDirectConsumer(consumer: PcmConsumer) {
-        if (!directConsumers.contains(consumer)) {
-            directConsumers.add(consumer)
-        }
+        directConsumers.addIfAbsent(consumer)
     }
 
     fun removeDirectConsumer(consumer: PcmConsumer) {
         directConsumers.remove(consumer)
     }
 
-    /**
-     * Registers a consumer to receive audio asynchronously through a bounded non-blocking channel.
-     * If the consumer falls behind, oldest frames can be dropped or handled safely to prevent OOM
-     * and guarantee that audio recording continues unaffected.
-     */
     fun addAsyncConsumer(consumer: PcmConsumer) {
         val channel = Channel<ByteArray>(
             capacity = bufferCapacity,
             onBufferOverflow = BufferOverflow.DROP_OLDEST
         )
-        val pair = Pair(consumer, channel)
-        asyncConsumers.add(pair)
-
-        scope.launch {
+        val job = scope.launch {
             for (audioChunk in channel) {
                 try {
                     consumer.onPcmAudio(audioChunk, audioChunk.size)
                 } catch (e: Exception) {
-                    // Prevent consumer exceptions from breaking the dispatch loop
+                    onConsumerError?.invoke(e)
                 }
             }
         }
+        asyncConsumers.add(AsyncEntry(consumer, channel, job))
     }
 
-    fun removeAsyncConsumer(consumer: PcmConsumer) {
-        val iterator = asyncConsumers.iterator()
-        while (iterator.hasNext()) {
-            val pair = iterator.next()
-            if (pair.first == consumer) {
-                pair.second.close()
-                asyncConsumers.remove(pair)
-            }
+    /**
+     * Stops feeding [consumer]. Audio already queued is still delivered, then [onDrained] runs on
+     * a background thread.
+     */
+    fun removeAsyncConsumer(consumer: PcmConsumer, onDrained: (() -> Unit)? = null) {
+        val entry = asyncConsumers.firstOrNull { it.consumer === consumer }
+        if (entry == null) {
+            onDrained?.invoke()
+            return
+        }
+        asyncConsumers.remove(entry)
+        entry.channel.close()
+        if (onDrained != null) {
+            entry.job.invokeOnCompletion { onDrained() }
         }
     }
 
     /**
-     * Dispatches captured PCM audio to all direct and asynchronous consumers.
+     * Dispatches captured PCM audio to all consumers.
      */
     fun dispatch(buffer: ByteArray, readSize: Int) {
         if (readSize <= 0) return
 
-        // 1. Dispatch to direct consumers (e.g. WAV recorder)
         for (consumer in directConsumers) {
             try {
                 consumer.onPcmAudio(buffer, readSize)
             } catch (e: Exception) {
-                // Keep processing
+                onConsumerError?.invoke(e)
             }
         }
 
-        // 2. Dispatch copies to async consumers (e.g. Speech recognition pipe)
         if (asyncConsumers.isNotEmpty()) {
             val copy = buffer.copyOf(readSize)
-            for (pair in asyncConsumers) {
-                pair.second.trySend(copy)
+            for (entry in asyncConsumers) {
+                entry.channel.trySend(copy)
             }
         }
 
-        // 3. Compute amplitude metrics
         calculateAndEmitAmplitude(buffer, readSize)
     }
 
     /**
-     * Computes RMS amplitude and dBFS from 16-bit Mono PCM buffer.
+     * Computes RMS amplitude and dBFS from a 16-bit mono PCM buffer.
      */
     private fun calculateAndEmitAmplitude(buffer: ByteArray, readSize: Int) {
         val listener = onAmplitudeUpdated ?: return
-        if (readSize < 2) return
+        val evenSize = readSize and -2
+        if (evenSize < 2) return
 
         var sumSquare = 0.0
-        val sampleCount = readSize / 2
+        val sampleCount = evenSize / 2
 
-        for (i in 0 until readSize step 2) {
-            // 16-bit little-endian sample
+        for (i in 0 until evenSize step 2) {
             val sample = (buffer[i].toInt() and 0xFF) or (buffer[i + 1].toInt() shl 8)
-            val shortSample = sample.toShort()
+            val shortSample = sample.toShort().toInt()
             sumSquare += (shortSample * shortSample).toDouble()
         }
 
         val rms = sqrt(sumSquare / sampleCount)
-        // Normalized 0.0 to 1.0 (Short.MAX_VALUE = 32767)
         val normalized = min(1.0, max(0.0, rms / 32767.0))
-
-        // Decibels relative to full scale (dBFS): range typically -90dB to 0dB
         val db = if (rms > 0) 20 * log10(rms / 32767.0) else -100.0
 
         listener(normalized, db)
     }
 
     /**
-     * Clears all consumers and terminates coroutines.
+     * Clears all consumers and terminates coroutines. The distributor cannot be used afterwards.
      */
     fun release() {
         directConsumers.clear()
-        for (pair in asyncConsumers) {
-            pair.second.close()
+        for (entry in asyncConsumers) {
+            entry.channel.close()
         }
         asyncConsumers.clear()
         scope.cancel()

@@ -17,7 +17,7 @@ class MockLiveSpeechRecorderPlatform
           supportsAudioSourceInjection: true,
           supportsOfflineRecognition: true,
           availableServices: ['com.google.android.tts'],
-          recommendedMode: 'offlineOnly',
+          recommendedMode: RecognitionMode.offlineOnly,
         ),
       );
 
@@ -28,8 +28,32 @@ class MockLiveSpeechRecorderPlatform
     RecognitionMode recognitionMode = RecognitionMode.automatic,
     bool enablePunctuation = true,
     bool enableSegmented = true,
+    bool enableBackgroundRecording = true,
+    String notificationTitle = 'Recording audio',
+    String notificationText = 'Microphone is in use',
   }) =>
       Future.value(true);
+
+  @override
+  Future<RecordingState> getRecordingState() =>
+      Future.value(RecordingState.recording);
+
+  @override
+  Future<PlaybackState> getPlaybackState() => Future.value(PlaybackState.idle);
+
+  @override
+  Future<List<SavedRecording>> listRecordings() => Future.value(const []);
+
+  @override
+  Future<bool> deleteRecording(String path) => Future.value(true);
+
+  @override
+  Stream<PlaybackProgress> get playbackProgressStream => Stream.value(
+        const PlaybackProgress(
+          position: Duration(seconds: 1),
+          duration: Duration(seconds: 12),
+        ),
+      );
 
   @override
   Future<String> start({String? outputPath}) =>
