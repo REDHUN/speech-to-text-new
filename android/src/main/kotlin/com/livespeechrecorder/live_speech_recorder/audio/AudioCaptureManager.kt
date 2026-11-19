@@ -43,10 +43,14 @@ interface PcmCaptureSource {
  *
  * Each start() opens a new AudioRecord and each stop() releases it, so a paused session holds no
  * microphone and cannot leak audio captured during the pause into the recording.
+ *
+ * When [micRouter] is given, a connected Bluetooth headset's microphone is used instead of the
+ * built-in one, and capture follows the headset if it connects or disconnects mid-recording.
  */
 class AudioCaptureManager(
     private val sampleRate: Int,
-    private val distributor: PcmAudioDistributor
+    private val distributor: PcmAudioDistributor,
+    private val micRouter: BluetoothMicRouter? = null
 ) : PcmCaptureSource {
 
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
@@ -66,8 +70,12 @@ class AudioCaptureManager(
     override fun start(): CaptureStartResult {
         if (captureThread != null) return CaptureStartResult(true)
 
+        startBluetoothRouting()
         val opened = openRecord()
-        val record = opened.first ?: return opened.second
+        val record = opened.first ?: run {
+            stopBluetoothRouting()
+            return opened.second
+        }
 
         running = true
         activeRecord = record
@@ -91,6 +99,34 @@ class AudioCaptureManager(
             thread.join(STOP_GRACE_MS)
         }
         captureThread = null
+        stopBluetoothRouting()
+    }
+
+    /** Brings up a connected Bluetooth headset's microphone so the next AudioRecord uses it. */
+    private fun startBluetoothRouting() {
+        val router = micRouter ?: return
+        router.listener = BluetoothMicRouter.Listener {
+            // The headset connected or disconnected mid-recording. A null device restores the default.
+            val record = activeRecord ?: return@Listener
+            try {
+                record.setPreferredDevice(router.activeInput)
+            } catch (ignored: IllegalStateException) {
+                // Released by the capture thread meanwhile.
+            }
+        }
+        if (!router.start() && router.hasBluetoothInput()) {
+            listener?.onCaptureWarning(
+                "BLUETOOTH_MIC_UNAVAILABLE",
+                "A Bluetooth headset is connected, but its microphone could not be activated. Recording uses the phone's microphone."
+            )
+        }
+    }
+
+    /** Lets the headset return to its normal (media) mode. Safe to call more than once. */
+    private fun stopBluetoothRouting() {
+        val router = micRouter ?: return
+        router.listener = null
+        router.stop()
     }
 
     @SuppressLint("MissingPermission")
@@ -110,6 +146,8 @@ class AudioCaptureManager(
                     "Could not initialize the microphone."
                 )
 
+            // Reopens after a lost connection keep using the headset too.
+            micRouter?.activeInput?.let { record.setPreferredDevice(it) }
             record.startRecording()
             if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
                 record.release()
@@ -231,6 +269,8 @@ class AudioCaptureManager(
         } finally {
             releaseRecord(activeRecord)
             activeRecord = null
+            // A fatal error ends capture without stop(), so free the headset here as well.
+            stopBluetoothRouting()
         }
     }
 

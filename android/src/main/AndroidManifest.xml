@@ -3,6 +3,9 @@
     <!-- Microphone permission for the single AudioRecord capture session -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <!-- Lets capture bring up a Bluetooth headset's voice link so its microphone is used -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
     <!-- Keeps microphone capture alive while the app is in the background -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />

@@ -102,7 +102,7 @@ flutter pub get
 
 ### 1. Permissions (`AndroidManifest.xml`)
 
-The plugin adds `RECORD_AUDIO`, the microphone foreground service permissions, and the speech service query automatically. To show the background recording notification, add this to `android/app/src/main/AndroidManifest.xml` and request the permission at runtime:
+The plugin adds `RECORD_AUDIO`, `MODIFY_AUDIO_SETTINGS` (used to switch to a Bluetooth headset microphone), the microphone foreground service permissions, and the speech service query automatically. To show the background recording notification, add this to `android/app/src/main/AndroidManifest.xml` and request the permission at runtime:
 
 ```xml
 <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -542,3 +542,6 @@ If microphone permission has not been granted, `start()` throws `SpeechRecorderE
 
 ### 5. Start Recording While the App Is Visible
 Android only allows the microphone foreground service to start from the foreground. If it cannot start, recording continues and `BACKGROUND_RECORDING_UNAVAILABLE` is reported.
+
+### 6. Bluetooth Headsets
+When a Bluetooth headset is connected, the recorder uses its microphone instead of the phone's. A headset that connects or disconnects during a recording is followed, and `AUDIO_ROUTE_CHANGED` is reported. While recording, the headset switches to its call (hands-free) mode, so its audio quality drops and media playback through it pauses. It returns to normal when the recording stops or pauses. If the headset microphone cannot be activated, for example during a phone call, recording uses the phone's microphone and `BLUETOOTH_MIC_UNAVAILABLE` is reported.

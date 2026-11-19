@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- A connected Bluetooth headset's microphone is now used for recording and transcription. Previously the phone's built-in microphone was always used. Headsets that connect or disconnect mid-recording are followed, and `BLUETOOTH_MIC_UNAVAILABLE` is reported when the headset microphone cannot be activated.
+- The plugin adds the `MODIFY_AUDIO_SETTINGS` permission, which Android grants automatically.
+
 ## 2.0.0
 
 ### Breaking changes

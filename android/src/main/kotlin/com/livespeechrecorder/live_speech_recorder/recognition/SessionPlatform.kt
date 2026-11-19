@@ -10,6 +10,7 @@ import android.os.Looper
 import android.speech.SpeechRecognizer
 import com.livespeechrecorder.live_speech_recorder.RecordingForegroundService
 import com.livespeechrecorder.live_speech_recorder.audio.AudioCaptureManager
+import com.livespeechrecorder.live_speech_recorder.audio.BluetoothMicRouter
 import com.livespeechrecorder.live_speech_recorder.audio.PcmAudioDistributor
 import com.livespeechrecorder.live_speech_recorder.audio.PcmCaptureSource
 import java.util.concurrent.LinkedBlockingQueue
@@ -87,7 +88,7 @@ class AndroidSessionPlatform(private val context: Context) : SessionPlatform {
     }
 
     override fun createCapture(sampleRate: Int, distributor: PcmAudioDistributor): PcmCaptureSource =
-        AudioCaptureManager(sampleRate, distributor)
+        AudioCaptureManager(sampleRate, distributor, BluetoothMicRouter(context))
 
     override fun createBackend(config: RecognitionConfig): SpeechRecognitionBackend? {
         // Older versions cannot share the recording's audio with the recognizer.
